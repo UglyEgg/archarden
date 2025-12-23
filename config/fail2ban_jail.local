@@ -1,0 +1,12 @@
+[DEFAULT]
+banaction = ufw
+findtime = 10m
+bantime = 1h
+maxretry = 5
+
+[sshd]
+enabled = true
+port = __SSH_PORT__
+filter = sshd
+logpath = /var/log/auth.log
+backend = systemd
