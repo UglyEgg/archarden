@@ -1,0 +1,10 @@
+# Base packages installed by the hardening script.
+ufw
+openssh
+fail2ban
+pacman-contrib
+podman
+slirp4netns
+fuse-overlayfs
+netavark
+aardvark-dns

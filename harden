@@ -103,11 +103,41 @@ preflight() {
     fi
 }
 
-install_packages() {
-    local pkgs=(ufw openssh fail2ban pacman-contrib podman slirp4netns fuse-overlayfs netavark aardvark-dns)
-    if [[ ${ENABLE_AUDITD} -eq 1 ]]; then
-        pkgs+=(audit)
+read_packages_from_file() {
+    local file="$1" optional="${2:-0}"
+    if [[ ! -f "${file}" ]]; then
+        if [[ "${optional}" -eq 1 ]]; then
+            log_warn "Optional package list not found: ${file}; skipping"
+            return
+        fi
+        log_error "Required package list not found: ${file}"
+        exit 1
     fi
+
+    grep -Ev '^[[:space:]]*(#|$)' "${file}"
+}
+
+install_packages() {
+    local pkgs=()
+    while IFS= read -r pkg; do
+        pkgs+=("${pkg}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/packages.list")
+
+    if [[ ${ENABLE_AUDITD} -eq 1 ]]; then
+        while IFS= read -r pkg; do
+            pkgs+=("${pkg}")
+        done < <(read_packages_from_file "${CONFIG_DIR}/packages.auditd.list" 1)
+    fi
+
+    while IFS= read -r pkg; do
+        pkgs+=("${pkg}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/packages.custom.list" 1)
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        log_warn "No packages defined for installation; skipping package installation"
+        return
+    fi
+
     log_info "Updating system and installing packages: ${pkgs[*]}"
     run_cmd "pacman -Syu --noconfirm ${pkgs[*]}"
 }
@@ -148,11 +178,57 @@ detect_kex() {
     fi
 }
 
+next_available_system_gid() {
+    local gid used
+    mapfile -t used < <(getent group | awk -F: '{print $3}')
+    for gid in $(seq 999 -1 100); do
+        if ! printf '%s\n' "${used[@]}" | grep -qx "${gid}"; then
+            echo "${gid}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_ssh_group() {
+    if getent group ssh >/dev/null 2>&1; then
+        local current_gid
+        current_gid=$(getent group ssh | cut -d: -f3)
+        if (( current_gid < 1000 )); then
+            log_info "SSH access group 'ssh' already exists as a system group (gid ${current_gid})"
+            return
+        fi
+
+        local new_gid
+        if ! new_gid=$(next_available_system_gid); then
+            log_error "Unable to find a free system gid (<1000) to convert 'ssh' group"
+            exit 1
+        fi
+
+        run_cmd "groupmod -g ${new_gid} ssh"
+        log_warn "Converted existing 'ssh' group to system gid ${new_gid}"
+        return
+    fi
+
+    run_cmd "groupadd -r ssh"
+    log_info "Created system group 'ssh' for SSH access control"
+}
+
+ensure_user_in_group() {
+    local user="$1" group="$2"
+    if id -nG "${user}" | tr ' ' '\n' | grep -qx "${group}"; then
+        return
+    fi
+    run_cmd "usermod -aG ${group} ${user}"
+    log_info "Added ${user} to ${group}"
+}
+
 configure_sshd() {
     local sshd_dir=/etc/ssh/sshd_config.d
     mkdir -p "${sshd_dir}"
     run_cmd "ssh-keygen -A"
-    local kex_line="$(detect_kex)"
+    local kex_line
+    kex_line="$(detect_kex)"
     local dropin="${sshd_dir}/10-hardening.conf"
     backup_file "${dropin}"
     sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/sshd_hardening.conf" | write_file_atomic "${dropin}"
@@ -188,9 +264,11 @@ create_admin_user() {
     if id -u "${USER_NAME}" >/dev/null 2>&1; then
         log_info "User ${USER_NAME} already exists"
     else
-        run_cmd "useradd -m -G wheel -s /bin/bash ${USER_NAME}"
-        log_info "Created user ${USER_NAME} and added to wheel"
+        run_cmd "useradd -m -G wheel,ssh -s /bin/bash ${USER_NAME}"
+        log_info "Created user ${USER_NAME} and added to wheel,ssh"
     fi
+    ensure_user_in_group "${USER_NAME}" wheel
+    ensure_user_in_group "${USER_NAME}" ssh
     if [[ ${ENABLE_LINGER} -eq 1 ]]; then
         run_cmd "loginctl enable-linger ${USER_NAME}"
     fi
@@ -306,6 +384,7 @@ main() {
     configure_journald
     configure_sysctl
     configure_tmp_mount
+    ensure_ssh_group
     create_admin_user
     configure_sshd
     restart_sshd_and_verify

@@ -1,0 +1,5 @@
+# Add one package per line to install alongside the defaults.
+# This file is optional and provides a place for local additions.
+nvim
+eza
+bat
