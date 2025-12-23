@@ -323,6 +323,7 @@ configure_ufw() {
         log_warn "UFW configuration disabled by flag"
         return
     fi
+    ensure_firewall_backend
     backup_file /etc/default/ufw
     run_cmd "sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw"
     run_cmd "ufw --force reset"
@@ -342,8 +343,7 @@ configure_ufw() {
         run_cmd "ufw allow 22/tcp"
     fi
 
-    run_cmd "ufw allow 80/tcp"
-    run_cmd "ufw allow 443/tcp"
+    configure_ufw_allowlist
 
     if [[ ${SKIP_FIREWALL_ENABLE} -eq 1 ]]; then
         log_warn "Skipping firewall enable as requested"
@@ -416,6 +416,52 @@ main() {
     configure_podman_templates
     status_report
     log_info "Hardening completed. Review status above before logging out."
+}
+
+ensure_firewall_backend() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_error "iptables not found; firewall configuration cannot continue."
+        exit 1
+    fi
+
+    if iptables -t filter -S >/dev/null 2>&1; then
+        return
+    fi
+
+    log_warn "iptables filter table unavailable; attempting to load firewall kernel modules"
+    local modules=()
+    while IFS= read -r mod; do
+        modules+=("${mod}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/firewall_modules.list")
+    for mod in "${modules[@]}"; do
+        if modinfo "${mod}" >/dev/null 2>&1; then
+            run_cmd "modprobe ${mod} || true"
+        fi
+    done
+
+    if iptables -t filter -S >/dev/null 2>&1; then
+        log_info "Firewall kernel modules loaded successfully"
+        return
+    fi
+
+    log_error "iptables backend still unavailable (filter table missing). UFW cannot be enabled. Ensure firewall kernel modules are present or rerun with --skip-firewall-enable or --disable-ufw."
+    exit 1
+}
+
+configure_ufw_allowlist() {
+    local ports=()
+    while IFS= read -r port; do
+        ports+=("${port}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/ufw_allow.list" 1)
+
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        log_warn "No UFW allowlist entries defined; skipping port allows"
+        return
+    fi
+
+    for port in "${ports[@]}"; do
+        run_cmd "ufw allow ${port}"
+    done
 }
 
 main "$@"
