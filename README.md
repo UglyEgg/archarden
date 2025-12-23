@@ -45,6 +45,8 @@ The packages the hardener installs are declared in plain text under `config/`:
 
 Add tools like `neovim`, `bat`, or `eza` by editing `config/packages.custom.list` (or the other lists, if you want to change the defaults) without modifying the script itself.
 
+SSH access is restricted to the dedicated `ssh` group. The admin user created via `--user` is added to both `wheel` (for sudo) and `ssh`; add any other accounts that need SSH access to the `ssh` group before enabling the firewall.
+
 ## What the hardener does
 
 - Updates packages and installs the lists defined in `config/packages.list` (and `config/packages.auditd.list` when `--enable-auditd` is used). Defaults include `ufw`, `openssh`, `fail2ban`, `pacman-contrib`, `podman`, `slirp4netns`, `fuse-overlayfs`, `netavark`, and `aardvark-dns`.
@@ -52,7 +54,7 @@ Add tools like `neovim`, `bat`, or `eza` by editing `config/packages.custom.list
 - Applies sysctl hardening (rp_filter, disable redirects/source routing, TCP syncookies).
 - Mounts `/tmp` as tmpfs with `nodev,nosuid,noexec`.
 - Reports enabled services for review.
-- Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf` and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t` and the port is verified before firewall changes.
+- Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf`, limits logins to the dedicated `ssh` group, and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t` and the port is verified before firewall changes.
 - Configures UFW (default deny incoming, allow/limit SSH on the chosen port, allow 80/443). Optional CIDR restriction and transition rule for port 22.
 - Sets up fail2ban with UFW actions and sshd jail on the hardened SSH port.
 - Installs Podman/NPM templates with the admin UI bound to `127.0.0.1:8181` (use SSH tunneling to reach it).

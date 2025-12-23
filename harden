@@ -178,6 +178,24 @@ detect_kex() {
     fi
 }
 
+ensure_ssh_group() {
+    if getent group ssh >/dev/null 2>&1; then
+        log_info "SSH access group 'ssh' already exists"
+    else
+        run_cmd "groupadd -r ssh"
+        log_info "Created system group 'ssh' for SSH access control"
+    fi
+}
+
+ensure_user_in_group() {
+    local user="$1" group="$2"
+    if id -nG "${user}" | tr ' ' '\n' | grep -qx "${group}"; then
+        return
+    fi
+    run_cmd "usermod -aG ${group} ${user}"
+    log_info "Added ${user} to ${group}"
+}
+
 configure_sshd() {
     local sshd_dir=/etc/ssh/sshd_config.d
     mkdir -p "${sshd_dir}"
@@ -218,9 +236,11 @@ create_admin_user() {
     if id -u "${USER_NAME}" >/dev/null 2>&1; then
         log_info "User ${USER_NAME} already exists"
     else
-        run_cmd "useradd -m -G wheel -s /bin/bash ${USER_NAME}"
-        log_info "Created user ${USER_NAME} and added to wheel"
+        run_cmd "useradd -m -G wheel,ssh -s /bin/bash ${USER_NAME}"
+        log_info "Created user ${USER_NAME} and added to wheel,ssh"
     fi
+    ensure_user_in_group "${USER_NAME}" wheel
+    ensure_user_in_group "${USER_NAME}" ssh
     if [[ ${ENABLE_LINGER} -eq 1 ]]; then
         run_cmd "loginctl enable-linger ${USER_NAME}"
     fi
@@ -336,6 +356,7 @@ main() {
     configure_journald
     configure_sysctl
     configure_tmp_mount
+    ensure_ssh_group
     create_admin_user
     configure_sshd
     restart_sshd_and_verify
