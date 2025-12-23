@@ -13,6 +13,7 @@ PUBKEY_VALUE=""
 ENABLE_AUDITD=0
 NON_INTERACTIVE=0
 ENABLE_LINGER=0
+SYSTEM_HOSTNAME=""
 SSH_PORT=2122
 SSH_CONNECTION_INFO=""
 
@@ -52,6 +53,7 @@ Usage: sudo ./harden [options]
   --disable-ufw            Do not configure UFW at all.
   --skip-firewall-enable   Configure UFW rules but do not enable the firewall.
   --enable-linger          Enable lingering for the admin user (rootless containers).
+  --hostname <name>        Set the system hostname.
   --dry-run                Show actions without changing the system.
   --non-interactive        Fail if required inputs are missing instead of prompting.
   -h, --help               Show this help.
@@ -72,6 +74,7 @@ parse_args() {
             --disable-ufw) ENABLE_UFW=0; shift;;
             --skip-firewall-enable) SKIP_FIREWALL_ENABLE=1; shift;;
             --enable-linger) ENABLE_LINGER=1; shift;;
+            --hostname) SYSTEM_HOSTNAME="$2"; shift 2;;
             --dry-run) DRY_RUN=1; shift;;
             --non-interactive) NON_INTERACTIVE=1; shift;;
             -h|--help) usage; exit 0;;
@@ -216,11 +219,30 @@ ensure_ssh_group() {
 
 ensure_user_in_group() {
     local user="$1" group="$2"
+    if ! id -u "${user}" >/dev/null 2>&1; then
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            log_info "[DRY-RUN] Would ensure ${user} is in group ${group}"
+            return
+        fi
+        log_error "User ${user} does not exist; cannot add to ${group}"
+        exit 1
+    fi
     if id -nG "${user}" | tr ' ' '\n' | grep -qx "${group}"; then
         return
     fi
     run_cmd "usermod -aG ${group} ${user}"
     log_info "Added ${user} to ${group}"
+}
+
+configure_hostname() {
+    if [[ -z "${SYSTEM_HOSTNAME}" ]]; then
+        return
+    fi
+    run_cmd "hostnamectl set-hostname ${SYSTEM_HOSTNAME}"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        return
+    fi
+    log_info "Hostname set to ${SYSTEM_HOSTNAME}"
 }
 
 configure_sshd() {
@@ -384,6 +406,7 @@ main() {
     configure_journald
     configure_sysctl
     configure_tmp_mount
+    configure_hostname
     ensure_ssh_group
     create_admin_user
     configure_sshd
