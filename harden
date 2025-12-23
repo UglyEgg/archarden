@@ -129,6 +129,10 @@ install_packages() {
         done < <(read_packages_from_file "${CONFIG_DIR}/packages.auditd.list" 1)
     fi
 
+    while IFS= read -r pkg; do
+        pkgs+=("${pkg}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/packages.custom.list" 1)
+
     if [[ ${#pkgs[@]} -eq 0 ]]; then
         log_warn "No packages defined for installation; skipping package installation"
         return

@@ -41,8 +41,9 @@ The packages the hardener installs are declared in plain text under `config/`:
 
 - `config/packages.list`: baseline packages installed on every run.
 - `config/packages.auditd.list`: packages added only when `--enable-auditd` is provided.
+- `config/packages.custom.list`: optional local additions without touching the defaults.
 
-Edit these files to add tools like `neovim`, `bat`, or `eza` without modifying the script itself.
+Add tools like `neovim`, `bat`, or `eza` by editing `config/packages.custom.list` (or the other lists, if you want to change the defaults) without modifying the script itself.
 
 ## What the hardener does
 
