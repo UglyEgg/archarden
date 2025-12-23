@@ -3,7 +3,7 @@ set -eEuo pipefail
 
 DRY_RUN=0
 ENABLE_FAIL2BAN=1
-ENABLE_UFW=1
+ENABLE_FIREWALL=1
 SKIP_FIREWALL_ENABLE=0
 KEEP_SSH_22=0
 RESTRICT_SSH_CIDR=""
@@ -47,11 +47,11 @@ Usage: sudo ./harden [options]
   --pubkey "<key>"         Public key string to install for the admin user.
   --ssh-port <port>        SSH port to configure (default: 2122).
   --restrict-ssh-cidr <C>  Restrict SSH via UFW to the given CIDR.
-  --keep-ssh-22            Keep SSH port 22 allowed in UFW (transition).
+  --keep-ssh-22            Keep SSH port 22 allowed (transition).
   --enable-auditd          Install and enable auditd.
   --disable-fail2ban       Skip fail2ban configuration.
-  --disable-ufw            Do not configure UFW at all.
-  --skip-firewall-enable   Configure UFW rules but do not enable the firewall.
+  --disable-firewall       Skip firewall configuration (alias: --disable-ufw).
+  --skip-firewall-enable   Write UFW rules but do not enable the firewall.
   --enable-linger          Enable lingering for the admin user (rootless containers).
   --hostname <name>        Set the system hostname.
   --dry-run                Show actions without changing the system.
@@ -71,7 +71,7 @@ parse_args() {
             --keep-ssh-22) KEEP_SSH_22=1; shift;;
             --enable-auditd) ENABLE_AUDITD=1; shift;;
             --disable-fail2ban) ENABLE_FAIL2BAN=0; shift;;
-            --disable-ufw) ENABLE_UFW=0; shift;;
+            --disable-firewall|--disable-ufw) ENABLE_FIREWALL=0; shift;;
             --skip-firewall-enable) SKIP_FIREWALL_ENABLE=1; shift;;
             --enable-linger) ENABLE_LINGER=1; shift;;
             --hostname) SYSTEM_HOSTNAME="$2"; shift 2;;
@@ -319,16 +319,28 @@ create_admin_user() {
 }
 
 configure_ufw() {
-    if [[ ${ENABLE_UFW} -eq 0 ]]; then
-        log_warn "UFW configuration disabled by flag"
+    if [[ ${ENABLE_FIREWALL} -eq 0 ]]; then
+        log_warn "Firewall configuration disabled by flag"
         return
     fi
     ensure_firewall_backend
+
+    if ! command -v ufw >/dev/null 2>&1; then
+        log_error "ufw command not found; install the ufw package."
+        exit 1
+    fi
+
     backup_file /etc/default/ufw
     run_cmd "sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw"
     run_cmd "ufw --force reset"
     run_cmd "ufw default deny incoming"
     run_cmd "ufw default allow outgoing"
+
+    if ufw --version 2>/dev/null | grep -qi nftables; then
+        log_info "UFW reports nftables backend"
+    else
+        log_warn "UFW backend is not reporting nftables; ensure iptables-nft is the active alternative."
+    fi
 
     if [[ -n "${RESTRICT_SSH_CIDR}" ]]; then
         run_cmd "ufw allow from ${RESTRICT_SSH_CIDR} to any port ${SSH_PORT} proto tcp"
@@ -343,18 +355,30 @@ configure_ufw() {
         run_cmd "ufw allow 22/tcp"
     fi
 
-    configure_ufw_allowlist
+    local allowlist_entries=()
+    while IFS= read -r port; do
+        allowlist_entries+=("${port}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/firewall_allow.list" 1)
+
+    if [[ ${#allowlist_entries[@]} -eq 0 ]]; then
+        log_warn "No firewall allowlist entries defined; skipping port allows"
+    else
+        for port in "${allowlist_entries[@]}"; do
+            run_cmd "ufw allow ${port}"
+        done
+    fi
 
     if [[ ${SKIP_FIREWALL_ENABLE} -eq 1 ]]; then
         log_warn "Skipping firewall enable as requested"
-    else
-        run_cmd "ufw --force enable"
-        if [[ ${KEEP_SSH_22} -eq 0 ]]; then
-            if [ "${DRY_RUN}" -eq 0 ]; then
-                ufw delete allow 22/tcp >/dev/null 2>&1 || true
-            else
-                log_info "[DRY-RUN] Would remove legacy SSH port 22 rule"
-            fi
+        return
+    fi
+
+    run_cmd "ufw --force enable"
+    if [[ ${KEEP_SSH_22} -eq 0 ]]; then
+        if [ "${DRY_RUN}" -eq 0 ]; then
+            ufw delete allow 22/tcp >/dev/null 2>&1 || true
+        else
+            log_info "[DRY-RUN] Would remove legacy SSH port 22 rule"
         fi
     fi
     run_cmd "ufw reload"
@@ -419,16 +443,16 @@ main() {
 }
 
 ensure_firewall_backend() {
-    if ! command -v iptables >/dev/null 2>&1; then
-        log_error "iptables not found; firewall configuration cannot continue."
+    if ! command -v nft >/dev/null 2>&1; then
+        log_error "nft command not found; firewall configuration cannot continue."
         exit 1
     fi
 
-    if iptables -t filter -S >/dev/null 2>&1; then
+    if nft list tables >/dev/null 2>&1; then
         return
     fi
 
-    log_warn "iptables filter table unavailable; attempting to load firewall kernel modules"
+    log_warn "nftables backend unavailable; attempting to load firewall kernel modules"
     local modules=()
     while IFS= read -r mod; do
         modules+=("${mod}")
@@ -439,29 +463,13 @@ ensure_firewall_backend() {
         fi
     done
 
-    if iptables -t filter -S >/dev/null 2>&1; then
+    if nft list tables >/dev/null 2>&1; then
         log_info "Firewall kernel modules loaded successfully"
         return
     fi
 
-    log_error "iptables backend still unavailable (filter table missing). UFW cannot be enabled. Ensure firewall kernel modules are present or rerun with --skip-firewall-enable or --disable-ufw."
+    log_error "nftables backend still unavailable. Ensure firewall kernel modules are present or rerun with --skip-firewall-enable or --disable-firewall."
     exit 1
-}
-
-configure_ufw_allowlist() {
-    local ports=()
-    while IFS= read -r port; do
-        ports+=("${port}")
-    done < <(read_packages_from_file "${CONFIG_DIR}/ufw_allow.list" 1)
-
-    if [[ ${#ports[@]} -eq 0 ]]; then
-        log_warn "No UFW allowlist entries defined; skipping port allows"
-        return
-    fi
-
-    for port in "${ports[@]}"; do
-        run_cmd "ufw allow ${port}"
-    done
 }
 
 main "$@"
