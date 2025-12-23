@@ -178,13 +178,40 @@ detect_kex() {
     fi
 }
 
+next_available_system_gid() {
+    local gid used
+    mapfile -t used < <(getent group | awk -F: '{print $3}')
+    for gid in $(seq 999 -1 100); do
+        if ! printf '%s\n' "${used[@]}" | grep -qx "${gid}"; then
+            echo "${gid}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 ensure_ssh_group() {
     if getent group ssh >/dev/null 2>&1; then
-        log_info "SSH access group 'ssh' already exists"
-    else
-        run_cmd "groupadd -r ssh"
-        log_info "Created system group 'ssh' for SSH access control"
+        local current_gid
+        current_gid=$(getent group ssh | cut -d: -f3)
+        if (( current_gid < 1000 )); then
+            log_info "SSH access group 'ssh' already exists as a system group (gid ${current_gid})"
+            return
+        fi
+
+        local new_gid
+        if ! new_gid=$(next_available_system_gid); then
+            log_error "Unable to find a free system gid (<1000) to convert 'ssh' group"
+            exit 1
+        fi
+
+        run_cmd "groupmod -g ${new_gid} ssh"
+        log_warn "Converted existing 'ssh' group to system gid ${new_gid}"
+        return
     fi
+
+    run_cmd "groupadd -r ssh"
+    log_info "Created system group 'ssh' for SSH access control"
 }
 
 ensure_user_in_group() {

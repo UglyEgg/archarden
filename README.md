@@ -45,7 +45,7 @@ The packages the hardener installs are declared in plain text under `config/`:
 
 Add tools like `neovim`, `bat`, or `eza` by editing `config/packages.custom.list` (or the other lists, if you want to change the defaults) without modifying the script itself.
 
-SSH access is restricted to the dedicated `ssh` group. The admin user created via `--user` is added to both `wheel` (for sudo) and `ssh`; add any other accounts that need SSH access to the `ssh` group before enabling the firewall.
+SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The admin user created via `--user` is added to both `wheel` (for sudo) and `ssh`; add any other accounts that need SSH access to the `ssh` group before enabling the firewall. If an `ssh` group already exists with a user-level gid, it is converted to a system gid during setup.
 
 ## What the hardener does
 
