@@ -227,7 +227,8 @@ configure_sshd() {
     local sshd_dir=/etc/ssh/sshd_config.d
     mkdir -p "${sshd_dir}"
     run_cmd "ssh-keygen -A"
-    local kex_line="$(detect_kex)"
+    local kex_line
+    kex_line="$(detect_kex)"
     local dropin="${sshd_dir}/10-hardening.conf"
     backup_file "${dropin}"
     sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/sshd_hardening.conf" | write_file_atomic "${dropin}"
