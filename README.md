@@ -32,6 +32,7 @@ sudo ./harden --dry-run --non-interactive --skip-firewall-enable
 - `--disable-ufw`: skip firewall configuration entirely.
 - `--skip-firewall-enable`: write UFW rules but do not enable them.
 - `--enable-linger`: enable lingering for the admin user (recommended for rootless Podman).
+- `--hostname <name>`: set the system hostname before other changes.
 - `--dry-run`: print planned actions without changing the system.
 - `--non-interactive`: fail if required inputs (like pubkey) are missing.
 
@@ -53,6 +54,7 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 - Enables `systemd-timesyncd` and persistent journald storage.
 - Applies sysctl hardening (rp_filter, disable redirects/source routing, TCP syncookies).
 - Mounts `/tmp` as tmpfs with `nodev,nosuid,noexec`.
+- Optionally sets the system hostname with `hostnamectl` when `--hostname` is provided.
 - Reports enabled services for review.
 - Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf`, limits logins to the dedicated `ssh` group, and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t` and the port is verified before firewall changes.
 - Configures UFW (default deny incoming, allow/limit SSH on the chosen port, allow 80/443). Optional CIDR restriction and transition rule for port 22.
