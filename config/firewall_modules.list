@@ -1,6 +1,4 @@
-ip_tables
-iptable_filter
-ip6_tables
-ip6table_filter
 nf_tables
+nfnetlink
+nf_conntrack
 nf_nat

@@ -1,5 +1,5 @@
 # Base packages installed by the hardening script.
-ufw
+nftables
 openssh
 fail2ban
 pacman-contrib
