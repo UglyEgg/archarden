@@ -33,7 +33,7 @@ Usage: sudo ./harden [options]
   --user <name>            Create or ensure admin user exists and in wheel group.
   --pubkey-file <path>     Public key file to install for the admin user.
   --pubkey "<key>"         Public key string to install for the admin user.
-  --ssh-port <port>        SSH port to configure (default: 1731).
+  --ssh-port <port>        SSH port to configure (default: 2122).
   --restrict-ssh-cidr <C>  Restrict SSH via UFW to the given CIDR.
   --keep-ssh-22            Keep SSH port 22 allowed in UFW (transition).
   --enable-auditd          Install and enable auditd.
