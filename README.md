@@ -35,9 +35,18 @@ sudo ./harden --dry-run --non-interactive --skip-firewall-enable
 - `--dry-run`: print planned actions without changing the system.
 - `--non-interactive`: fail if required inputs (like pubkey) are missing.
 
+## Package selection
+
+The packages the hardener installs are declared in plain text under `config/`:
+
+- `config/packages.list`: baseline packages installed on every run.
+- `config/packages.auditd.list`: packages added only when `--enable-auditd` is provided.
+
+Edit these files to add tools like `neovim`, `bat`, or `eza` without modifying the script itself.
+
 ## What the hardener does
 
-- Updates packages and installs: `ufw`, `openssh`, `fail2ban`, `pacman-contrib`, `podman`, `slirp4netns`, `fuse-overlayfs`, `netavark`, `aardvark-dns` (plus `audit` if requested).
+- Updates packages and installs the lists defined in `config/packages.list` (and `config/packages.auditd.list` when `--enable-auditd` is used). Defaults include `ufw`, `openssh`, `fail2ban`, `pacman-contrib`, `podman`, `slirp4netns`, `fuse-overlayfs`, `netavark`, and `aardvark-dns`.
 - Enables `systemd-timesyncd` and persistent journald storage.
 - Applies sysctl hardening (rp_filter, disable redirects/source routing, TCP syncookies).
 - Mounts `/tmp` as tmpfs with `nodev,nosuid,noexec`.

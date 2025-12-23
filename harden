@@ -103,11 +103,37 @@ preflight() {
     fi
 }
 
-install_packages() {
-    local pkgs=(ufw openssh fail2ban pacman-contrib podman slirp4netns fuse-overlayfs netavark aardvark-dns)
-    if [[ ${ENABLE_AUDITD} -eq 1 ]]; then
-        pkgs+=(audit)
+read_packages_from_file() {
+    local file="$1" optional="${2:-0}"
+    if [[ ! -f "${file}" ]]; then
+        if [[ "${optional}" -eq 1 ]]; then
+            log_warn "Optional package list not found: ${file}; skipping"
+            return
+        fi
+        log_error "Required package list not found: ${file}"
+        exit 1
     fi
+
+    grep -Ev '^[[:space:]]*(#|$)' "${file}"
+}
+
+install_packages() {
+    local pkgs=()
+    while IFS= read -r pkg; do
+        pkgs+=("${pkg}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/packages.list")
+
+    if [[ ${ENABLE_AUDITD} -eq 1 ]]; then
+        while IFS= read -r pkg; do
+            pkgs+=("${pkg}")
+        done < <(read_packages_from_file "${CONFIG_DIR}/packages.auditd.list" 1)
+    fi
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        log_warn "No packages defined for installation; skipping package installation"
+        return
+    fi
+
     log_info "Updating system and installing packages: ${pkgs[*]}"
     run_cmd "pacman -Syu --noconfirm ${pkgs[*]}"
 }
