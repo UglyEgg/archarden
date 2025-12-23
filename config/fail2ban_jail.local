@@ -1,5 +1,5 @@
 [DEFAULT]
-banaction = nftables-multiport
+banaction = ufw
 findtime = 10m
 bantime = 1h
 maxretry = 5

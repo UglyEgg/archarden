@@ -16,7 +16,6 @@ ENABLE_LINGER=0
 SYSTEM_HOSTNAME=""
 SSH_PORT=2122
 SSH_CONNECTION_INFO=""
-ALLOW_SSH_22=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${SCRIPT_DIR}/config"
@@ -47,12 +46,12 @@ Usage: sudo ./harden [options]
   --pubkey-file <path>     Public key file to install for the admin user.
   --pubkey "<key>"         Public key string to install for the admin user.
   --ssh-port <port>        SSH port to configure (default: 2122).
-  --restrict-ssh-cidr <C>  Restrict SSH via nftables to the given CIDR.
+  --restrict-ssh-cidr <C>  Restrict SSH via UFW to the given CIDR.
   --keep-ssh-22            Keep SSH port 22 allowed (transition).
   --enable-auditd          Install and enable auditd.
   --disable-fail2ban       Skip fail2ban configuration.
-  --disable-firewall       Skip nftables firewall configuration (alias: --disable-ufw).
-  --skip-firewall-enable   Write nftables rules but do not enable/apply them.
+  --disable-firewall       Skip firewall configuration (alias: --disable-ufw).
+  --skip-firewall-enable   Write UFW rules but do not enable the firewall.
   --enable-linger          Enable lingering for the admin user (rootless containers).
   --hostname <name>        Set the system hostname.
   --dry-run                Show actions without changing the system.
@@ -319,100 +318,41 @@ create_admin_user() {
     fi
 }
 
-render_allow_rule() {
-    local entry="$1"
-    if [[ -z "${entry}" ]]; then
-        return
-    fi
-    if [[ "${entry}" =~ ^([0-9]+)/(tcp|udp)$ ]]; then
-        printf '        %s dport %s ct state new,established accept\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
-    elif [[ "${entry}" =~ ^([0-9]+)$ ]]; then
-        printf '        tcp dport %s ct state new,established accept\n' "${entry}"
-        printf '        udp dport %s ct state new,established accept\n' "${entry}"
-    else
-        log_warn "Skipping invalid firewall allowlist entry: ${entry}"
-    fi
-}
-
-generate_nftables_ruleset() {
-    local allow_entries=("$@")
-    local allow_lines=()
-    local entry
-    for entry in "${allow_entries[@]}"; do
-        while IFS= read -r rule_line; do
-            allow_lines+=("${rule_line}")
-        done < <(render_allow_rule "${entry}")
-    done
-
-    local ssh_rule
-    if [[ -n "${RESTRICT_SSH_CIDR}" ]]; then
-        local addr_family="ip"
-        if [[ "${RESTRICT_SSH_CIDR}" == *:* ]]; then
-            addr_family="ip6"
-        fi
-        ssh_rule="        ${addr_family} saddr ${RESTRICT_SSH_CIDR} tcp dport ${SSH_PORT} ct state new limit rate 15/minute accept"
-    else
-        ssh_rule="        tcp dport ${SSH_PORT} ct state new limit rate 15/minute accept"
-    fi
-
-    local ssh_22_rule=""
-    if [[ ${ALLOW_SSH_22} -eq 1 ]]; then
-        ssh_22_rule="        tcp dport 22 ct state new,established accept"
-    fi
-
-    local allow_block=""
-    if [[ ${#allow_lines[@]} -gt 0 ]]; then
-        allow_block=$(printf "%s\n" "${allow_lines[@]}")
-    fi
-
-    cat <<EOF
-#!/usr/sbin/nft -f
-
-flush ruleset
-
-table inet filter {
-    chain input {
-        type filter hook input priority 0;
-        policy drop;
-
-        ct state established,related accept
-        ct state invalid drop
-        iifname "lo" accept
-        ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept
-
-${ssh_rule}
-${ssh_22_rule}
-${allow_block}
-    }
-
-    chain forward {
-        type filter hook forward priority 0;
-        policy drop;
-
-        ct state established,related accept
-    }
-
-    chain output {
-        type filter hook output priority 0;
-        policy accept;
-    }
-}
-EOF
-}
-
-configure_nftables() {
+configure_ufw() {
     if [[ ${ENABLE_FIREWALL} -eq 0 ]]; then
         log_warn "Firewall configuration disabled by flag"
         return
     fi
     ensure_firewall_backend
 
-    ALLOW_SSH_22=0
+    if ! command -v ufw >/dev/null 2>&1; then
+        log_error "ufw command not found; install the ufw package."
+        exit 1
+    fi
+
+    backup_file /etc/default/ufw
+    run_cmd "sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw"
+    run_cmd "ufw --force reset"
+    run_cmd "ufw default deny incoming"
+    run_cmd "ufw default allow outgoing"
+
+    if ufw --version 2>/dev/null | grep -qi nftables; then
+        log_info "UFW reports nftables backend"
+    else
+        log_warn "UFW backend is not reporting nftables; ensure iptables-nft is the active alternative."
+    fi
+
+    if [[ -n "${RESTRICT_SSH_CIDR}" ]]; then
+        run_cmd "ufw allow from ${RESTRICT_SSH_CIDR} to any port ${SSH_PORT} proto tcp"
+    else
+        run_cmd "ufw limit ${SSH_PORT}/tcp"
+    fi
+
+    if ss -tulpn 2>/dev/null | grep -q ':22'; then
+        run_cmd "ufw allow 22/tcp"
+    fi
     if [[ ${KEEP_SSH_22} -eq 1 ]]; then
-        ALLOW_SSH_22=1
-    elif [[ ${SKIP_FIREWALL_ENABLE} -eq 1 ]] && ss -tulpn 2>/dev/null | grep -q ':22'; then
-        ALLOW_SSH_22=1
+        run_cmd "ufw allow 22/tcp"
     fi
 
     local allowlist_entries=()
@@ -420,18 +360,28 @@ configure_nftables() {
         allowlist_entries+=("${port}")
     done < <(read_packages_from_file "${CONFIG_DIR}/firewall_allow.list" 1)
 
-    backup_file /etc/nftables.conf
-    local nft_rules
-    nft_rules=$(generate_nftables_ruleset "${allowlist_entries[@]}")
-    printf '%s\n' "${nft_rules}" | write_file_atomic /etc/nftables.conf
+    if [[ ${#allowlist_entries[@]} -eq 0 ]]; then
+        log_warn "No firewall allowlist entries defined; skipping port allows"
+    else
+        for port in "${allowlist_entries[@]}"; do
+            run_cmd "ufw allow ${port}"
+        done
+    fi
 
     if [[ ${SKIP_FIREWALL_ENABLE} -eq 1 ]]; then
-        log_warn "Skipping firewall apply/enable as requested"
+        log_warn "Skipping firewall enable as requested"
         return
     fi
 
-    run_cmd "nft -f /etc/nftables.conf"
-    run_cmd "systemctl enable --now nftables.service"
+    run_cmd "ufw --force enable"
+    if [[ ${KEEP_SSH_22} -eq 0 ]]; then
+        if [ "${DRY_RUN}" -eq 0 ]; then
+            ufw delete allow 22/tcp >/dev/null 2>&1 || true
+        else
+            log_info "[DRY-RUN] Would remove legacy SSH port 22 rule"
+        fi
+    fi
+    run_cmd "ufw reload"
 }
 
 configure_fail2ban() {
@@ -460,8 +410,8 @@ EOT
 status_report() {
     log_info "==== STATUS REPORT ===="
     status_cmd "ss -tulnp || true"
-    if command -v nft >/dev/null 2>&1; then
-        status_cmd "nft list ruleset || true"
+    if command -v ufw >/dev/null 2>&1; then
+        status_cmd "ufw status verbose || true"
     fi
     if systemctl list-unit-files --type=service | grep -q fail2ban.service; then
         status_cmd "systemctl status fail2ban --no-pager || true"
@@ -485,7 +435,7 @@ main() {
     create_admin_user
     configure_sshd
     restart_sshd_and_verify
-    configure_nftables
+    configure_ufw
     configure_fail2ban
     configure_podman_templates
     status_report

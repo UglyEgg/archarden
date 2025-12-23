@@ -25,12 +25,12 @@ sudo ./harden --dry-run --non-interactive --skip-firewall-enable
 - `--user <name>`: create/ensure admin user (wheel group) exists.
 - `--pubkey-file <path>` / `--pubkey "<key>"`: install SSH public key for the admin user.
 - `--ssh-port <port>`: set the SSH daemon port (default 2122).
-- `--restrict-ssh-cidr <CIDR>`: restrict SSH access in nftables.
-- `--keep-ssh-22`: keep port 22 open in nftables after migration.
+- `--restrict-ssh-cidr <CIDR>`: restrict SSH access in UFW.
+- `--keep-ssh-22`: keep port 22 open in UFW after migration.
 - `--enable-auditd`: install and enable auditd (optional).
 - `--disable-fail2ban`: skip fail2ban setup.
-- `--disable-firewall`: skip nftables configuration entirely (alias: `--disable-ufw`).
-- `--skip-firewall-enable`: write nftables rules but do not enable/apply them.
+- `--disable-firewall`: skip firewall configuration entirely (alias: `--disable-ufw`).
+- `--skip-firewall-enable`: write UFW rules but do not enable them.
 - `--enable-linger`: enable lingering for the admin user (recommended for rootless Podman).
 - `--hostname <name>`: set the system hostname before other changes.
 - `--dry-run`: print planned actions without changing the system.
@@ -50,22 +50,22 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 
 ## What the hardener does
 
-- Updates packages and installs the lists defined in `config/packages.list` (and `config/packages.auditd.list` when `--enable-auditd` is used). Defaults include `nftables`, `openssh`, `fail2ban`, `pacman-contrib`, `podman`, `slirp4netns`, `fuse-overlayfs`, `netavark`, and `aardvark-dns`.
+- Updates packages and installs the lists defined in `config/packages.list` (and `config/packages.auditd.list` when `--enable-auditd` is used). Defaults include `ufw`, `nftables`, `openssh`, `fail2ban`, `pacman-contrib`, `podman`, `slirp4netns`, `fuse-overlayfs`, `netavark`, and `aardvark-dns`.
 - Enables `systemd-timesyncd` and persistent journald storage.
 - Applies sysctl hardening (rp_filter, disable redirects/source routing, TCP syncookies).
 - Mounts `/tmp` as tmpfs with `nodev,nosuid,noexec`.
 - Optionally sets the system hostname with `hostnamectl` when `--hostname` is provided.
 - Reports enabled services for review.
 - Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf`, limits logins to the dedicated `ssh` group, and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t` and the port is verified before firewall changes.
-- Configures nftables (default deny incoming, allows SSH on the chosen port, allows `config/firewall_allow.list` entries by default). Optional CIDR restriction for SSH and a transition rule for port 22.
-- Sets up fail2ban with nftables actions and sshd jail on the hardened SSH port.
+- Configures UFW (nftables backend, default deny incoming, allows SSH on the chosen port, allows `config/firewall_allow.list` entries by default). Optional CIDR restriction for SSH and a transition rule for port 22.
+- Sets up fail2ban with UFW actions and sshd jail on the hardened SSH port.
 - Installs Podman/NPM templates with the admin UI bound to `127.0.0.1:8181` (use SSH tunneling to reach it).
 
 ## Safe SSH migration
 
 1. Run `./harden` with your public key. Use `--ssh-port <port>` to pick a custom port (default 2122) and `--keep-ssh-22` for a transition period if desired.
-2. The script writes the sshd drop-in, validates config, restarts sshd, and verifies the chosen port is listening **before** enabling nftables.
-3. nftables is only enabled after sshd passes validation; port 22 can remain open with `--keep-ssh-22`.
+2. The script writes the sshd drop-in, validates config, restarts sshd, and verifies the chosen port is listening **before** enabling UFW.
+3. UFW is only enabled after sshd passes validation; port 22 can remain open with `--keep-ssh-22`.
 4. Confirm you can log in on the hardened SSH port before closing existing sessions.
 
 ## Accessing NPM admin UI
@@ -82,7 +82,7 @@ Then browse to `http://localhost:8181` locally. The public ports 80/443 remain p
 
 Backups with timestamped `.bak` suffix are created for touched files:
 
-- `/etc/nftables.conf`
+- `/etc/default/ufw`
 - `/etc/ssh/sshd_config.d/10-hardening.conf` (if pre-existing)
 - `/etc/systemd/journald.conf`
 - `/etc/sysctl.d/99-hardening.conf`
@@ -92,8 +92,8 @@ Backups with timestamped `.bak` suffix are created for touched files:
 To roll back:
 
 1. Replace the active file with the latest `.bak` copy (e.g., `cp /etc/sysctl.d/99-hardening.conf.*.bak /etc/sysctl.d/99-hardening.conf`).
-2. Reload or restart the affected service (`systemctl restart systemd-journald`, `systemctl restart sshd`, `nft -f /etc/nftables.conf`, etc.).
-3. Disable services if desired: `systemctl disable --now nftables fail2ban tmp.mount`.
+2. Reload or restart the affected service (`systemctl restart systemd-journald`, `systemctl restart sshd`, `ufw reload`, etc.).
+3. Disable services if desired: `systemctl disable --now ufw fail2ban tmp.mount`.
 
 ## Make targets
 
