@@ -1,0 +1,15 @@
+[Unit]
+Description=Nginx Proxy Manager (bound to localhost)
+After=network.target
+
+[Container]
+Image=docker.io/jc21/nginx-proxy-manager:latest
+Network=host
+PublishPort=127.0.0.1:8181:81
+PublishPort=80:80
+PublishPort=443:443
+Volume=npm-data:/data
+Volume=npm-letsencrypt:/etc/letsencrypt
+
+[Install]
+WantedBy=default.target
