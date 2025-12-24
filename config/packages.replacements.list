@@ -1,0 +1,5 @@
+# Optional package replacement rules.
+# Format: <installed_package> <preferred_package>
+# When the preferred package is requested and the installed package is present,
+# the installed package will be removed before installing the preferred one.
+iptables iptables-nft

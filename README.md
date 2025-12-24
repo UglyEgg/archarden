@@ -45,6 +45,7 @@ The packages the hardener installs are declared in plain text under `config/`:
 - `config/packages.list`: baseline packages installed on every run.
 - `config/packages.auditd.list`: packages added only when `--enable-auditd` is provided.
 - `config/packages.custom.list`: optional local additions without touching the defaults.
+- `config/packages.replacements.list`: optional pairs where a requested package should replace an already-installed one (e.g., `iptables iptables-nft`).
 
 Add tools like `neovim`, `bat`, or `eza` by editing `config/packages.custom.list` (or the other lists, if you want to change the defaults) without modifying the script itself. Ingress firewall allows are defined in `config/firewall_allow.list` (defaults to `80/tcp` and `443/tcp`); edit this file to open additional ports.
 
