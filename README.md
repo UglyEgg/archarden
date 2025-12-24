@@ -22,19 +22,22 @@ sudo ./harden --dry-run --non-interactive --skip-firewall-enable
 
 ## Flags
 
-- `--user <name>`: create/ensure admin user (wheel group) exists.
-- `--pubkey-file <path>` / `--pubkey "<key>"`: install SSH public key for the admin user.
+- `--hostname <name>`: (required) set the system hostname before other changes.
+- `--user <name>`: (required) create/ensure admin user (wheel group) exists.
+- `--pubkey-file <path>` / `--pubkey "<key>"`: (required) install SSH public key for the admin user.
 - `--ssh-port <port>`: set the SSH daemon port (default 2122).
 - `--restrict-ssh-cidr <CIDR>`: restrict SSH access in UFW.
 - `--keep-ssh-22`: keep port 22 open in UFW after migration.
 - `--enable-auditd`: install and enable auditd (optional).
 - `--disable-fail2ban`: skip fail2ban setup.
 - `--disable-firewall`: skip firewall configuration entirely (alias: `--disable-ufw`).
+- `--disable-linger`: disable lingering for the admin user (enabled by default).
 - `--skip-firewall-enable`: write UFW rules but do not enable them.
 - `--enable-linger`: enable lingering for the admin user (recommended for rootless Podman).
 - `--hostname <name>`: set the system hostname before other changes.
 - `--dry-run`: print planned actions without changing the system.
 - `--non-interactive`: fail if required inputs (like pubkey) are missing.
+- `--version`: show the installed version of archarden.
 - `--resume`: internal flag used when the continuation service resumes after the LTS reboot.
 
 ## Package selection

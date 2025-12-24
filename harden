@@ -11,6 +11,7 @@ source "${SCRIPT_DIR}/lib/utils.sh"
 DRY_RUN=0
 ENABLE_FAIL2BAN=1
 ENABLE_FIREWALL=1
+ENABLE_LINGER=1
 SKIP_FIREWALL_ENABLE=0
 KEEP_SSH_22=0
 RESTRICT_SSH_CIDR=""
@@ -19,7 +20,6 @@ PUBKEY_FILE=""
 PUBKEY_VALUE=""
 ENABLE_AUDITD=0
 NON_INTERACTIVE=0
-ENABLE_LINGER=0
 SYSTEM_HOSTNAME=""
 SSH_PORT=2122
 SSH_CONNECTION_INFO=""
@@ -31,6 +31,7 @@ STATE_DIR="/var/lib/vps-harden"
 PENDING_ARGS_FILE="${STATE_DIR}/pending_args"
 CONTINUE_SERVICE="/etc/systemd/system/vps-harden-continue.service"
 CONTINUE_SERVICE_TEMPLATE="${TEMPLATES_DIR}/systemd/vps-harden-continue.service"
+FINAL_LOG_FILE=""
 
 clear_pending_state() {
     if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -388,21 +389,29 @@ trap 'error_trap' ERR
 
 final_summary() {
     log_info "==== ✅ Hardening completed ===="
-    echo -e "\e[32m✅ Hardening completed successfully.\e[0m"
-    if [[ ${ENABLE_FIREWALL} -eq 1 ]]; then
-        echo "🔒 Firewall: configured (ufw)"
+    local summary output_dir
+    summary=$(
+        cat <<EOF
+✅ Hardening completed successfully.
+$( (( ENABLE_FIREWALL )) && echo "🔒 Firewall: configured (ufw)" || echo "🔓 Firewall: skipped")
+$( (( ENABLE_FAIL2BAN )) && echo "🛡️ Fail2ban: enabled" || echo "🛡️ Fail2ban: skipped")
+🐧 Kernel: $(uname -r)
+📦 Packages updated and installed.
+🧰 Templates installed to /usr/share/vps-harden/templates/containers
+📜 Log: ${LOG_FILE}
+EOF
+    )
+    if [[ -n "${USER_NAME}" ]] && id -u "${USER_NAME}" >/dev/null 2>&1; then
+        output_dir="/home/${USER_NAME}"
     else
-        echo "🔓 Firewall: skipped"
+        output_dir="/root"
     fi
-    if [[ ${ENABLE_FAIL2BAN} -eq 1 ]]; then
-        echo "🛡️ Fail2ban: enabled"
-    else
-        echo "🛡️ Fail2ban: skipped"
+    FINAL_LOG_FILE="${output_dir}/vps-harden.log"
+    echo "${summary}" > "${FINAL_LOG_FILE}"
+    if [[ -n "${USER_NAME}" ]] && id -u "${USER_NAME}" >/dev/null 2>&1; then
+        chown "${USER_NAME}:${USER_NAME}" "${FINAL_LOG_FILE}"
     fi
-    echo "🐧 Kernel: $(uname -r)"
-    echo "📦 Packages updated and installed."
-    echo "🧰 Templates installed to /usr/share/vps-harden/templates/containers"
-    echo "📜 Log: ${LOG_FILE}"
+    log_info "Summary written to ${FINAL_LOG_FILE}"
 }
 
 install_packages() {
@@ -462,14 +471,15 @@ parse_args() {
             --user) USER_NAME="$2"; shift 2;;
             --pubkey-file) PUBKEY_FILE="$2"; shift 2;;
             --pubkey) PUBKEY_VALUE="$2"; shift 2;;
+            --version) show_version; exit 0;;
             --ssh-port) SSH_PORT="$2"; shift 2;;
             --restrict-ssh-cidr) RESTRICT_SSH_CIDR="$2"; shift 2;;
             --keep-ssh-22) KEEP_SSH_22=1; shift;;
             --enable-auditd) ENABLE_AUDITD=1; shift;;
             --disable-fail2ban) ENABLE_FAIL2BAN=0; shift;;
             --disable-firewall|--disable-ufw) ENABLE_FIREWALL=0; shift;;
+            --disable-linger) ENABLE_LINGER=0; shift;;
             --skip-firewall-enable) SKIP_FIREWALL_ENABLE=1; shift;;
-            --enable-linger) ENABLE_LINGER=1; shift;;
             --dry-run) DRY_RUN=1; shift;;
             --non-interactive) NON_INTERACTIVE=1; shift;;
             --resume) RESUME_MODE=1; shift;;
@@ -482,6 +492,18 @@ parse_args() {
 
 preflight() {
     require_root
+    if [[ -z "${SYSTEM_HOSTNAME}" ]]; then
+        log_error "--hostname is required."
+        exit 1
+    fi
+    if [[ -z "${USER_NAME}" ]]; then
+        log_error "--user is required."
+        exit 1
+    fi
+    if [[ -z "${PUBKEY_FILE}" && -z "${PUBKEY_VALUE}" ]]; then
+        log_error "Either --pubkey-file or --pubkey is required."
+        exit 1
+    fi
     if ! grep -qi 'arch' /etc/os-release; then
         log_error "This tool is intended for Arch Linux systems."
         exit 1
@@ -571,14 +593,15 @@ Usage: sudo ./harden [options]
   --user <name>            Create or ensure admin user exists and in wheel group.
   --pubkey-file <path>     Public key file to install for the admin user.
   --pubkey "<key>"         Public key string to install for the admin user.
+  --version                Show version and exit.
   --ssh-port <port>        SSH port to configure (default: 2122).
   --restrict-ssh-cidr <C>  Restrict SSH via UFW to the given CIDR.
   --keep-ssh-22            Keep SSH port 22 allowed (transition).
   --enable-auditd          Install and enable auditd.
   --disable-fail2ban       Skip fail2ban configuration.
   --disable-firewall       Skip firewall configuration (alias: --disable-ufw).
+  --disable-linger         Disable lingering for the admin user.
   --skip-firewall-enable   Write UFW rules but do not enable the firewall.
-  --enable-linger          Enable lingering for the admin user (rootless containers).
   --dry-run                Show actions without changing the system.
   --non-interactive        Fail if required inputs are missing instead of prompting.
   --resume                 Internal flag: resume after reboot; do not re-arm continuation.
@@ -603,6 +626,15 @@ write_continue_service() {
         "INSTALL_PREFIX=${INSTALL_PREFIX}"
     run_cmd "systemctl daemon-reload"
     run_cmd "systemctl enable vps-harden-continue.service"
+}
+
+show_version() {
+    local version_file="${SCRIPT_DIR}/VERSION"
+    if [[ -f "${version_file}" ]]; then
+        cat "${version_file}"
+    else
+        echo "unknown"
+    fi
 }
 
 main() {
@@ -630,3 +662,12 @@ main() {
 }
 
 main "$@"
+
+show_version() {
+    local version_file="${SCRIPT_DIR}/VERSION"
+    if [[ -f "${version_file}" ]]; then
+        cat "${version_file}"
+    else
+        echo "unknown"
+    fi
+}
