@@ -33,10 +33,9 @@ sudo ./harden --dry-run --non-interactive --skip-firewall-enable
 - `--disable-firewall`: skip firewall configuration entirely (alias: `--disable-ufw`).
 - `--disable-linger`: disable lingering for the admin user (enabled by default).
 - `--skip-firewall-enable`: write UFW rules but do not enable them.
-- `--enable-linger`: enable lingering for the admin user (recommended for rootless Podman).
-- `--hostname <name>`: set the system hostname before other changes.
 - `--dry-run`: print planned actions without changing the system.
 - `--non-interactive`: fail if required inputs (like pubkey) are missing.
+- `--version`: show the installed version of archarden.
 - `--version`: show the installed version of archarden.
 - `--resume`: internal flag used when the continuation service resumes after the LTS reboot.
 
