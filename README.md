@@ -36,7 +36,6 @@ sudo ./harden --dry-run --non-interactive --skip-firewall-enable
 - `--dry-run`: print planned actions without changing the system.
 - `--non-interactive`: fail if required inputs (like pubkey) are missing.
 - `--version`: show the installed version of archarden.
-- `--version`: show the installed version of archarden.
 - `--resume`: internal flag used when the continuation service resumes after the LTS reboot.
 
 ## Package selection
@@ -63,7 +62,7 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 - Configures UFW (nftables backend via `iptables-nft`, default deny incoming, allows SSH on the chosen port, allows `config/firewall_allow.list` entries by default). Optional CIDR restriction for SSH and a transition rule for port 22.
 - Sets up fail2ban with UFW actions and sshd jail on the hardened SSH port.
 - Installs Podman templates: NPM with the admin UI bound to `127.0.0.1:8181` and Gotify bound to `127.0.0.1:8090`.
-- Ensures linux-lts is installed and set as the GRUB default, reboots once, and auto-resumes hardening via a systemd oneshot continuation unit. A final emoji summary is printed after completion.
+- Ensures linux-lts is installed and set as the GRUB default, reboots once (automatically after a 5-second grace period), and auto-resumes hardening via a systemd oneshot continuation unit. A final emoji summary is printed after completion.
 
 ## Safe SSH migration
 
@@ -71,6 +70,12 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 2. The script writes the sshd drop-in, validates config, restarts sshd, and verifies the chosen port is listening **before** enabling UFW.
 3. UFW is only enabled after sshd passes validation; port 22 can remain open with `--keep-ssh-22`.
 4. Confirm you can log in on the hardened SSH port before closing existing sessions.
+
+## Logging and resume flow
+
+- Phase 0 (pre-reboot) actions log to `/var/log/vps-harden.phase0.log`. The resume command (for manual continuation) is also written there.
+- After the automatic reboot into the LTS kernel, the resumed run logs to `/var/log/vps-harden.phase1.log`.
+- A friendly summary is written to `/root/vps-harden.log` (or the admin user's home) after completion.
 
 ## Accessing NPM admin UI
 
@@ -81,6 +86,10 @@ ssh -L 8181:127.0.0.1:8181 user@server -p 2122  # replace port if you used --ssh
 ```
 
 Then browse to `http://localhost:8181` locally. The public ports 80/443 remain published for proxied sites only.
+
+## Gotify connectivity
+
+Gotify is bound to `127.0.0.1:8090` by default so it is reachable locally or over an SSH tunnel (e.g., `ssh -L 8090:127.0.0.1:8090 user@server -p 2122`). No additional firewall rules are required in this mode. If you rebind Gotify to a non-loopback address, add the desired port (e.g., `8090/tcp`) to `config/firewall_allow.list` before running the hardener so UFW allows inbound access.
 
 ## Rollback / restore
 

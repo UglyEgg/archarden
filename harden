@@ -3,7 +3,15 @@
 # Copyright (c) 2025 Richard Majewski
 set -eEuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="/var/log/vps-harden.phase0.log"
+for arg in "$@"; do
+    if [[ "${arg}" == "--resume" ]]; then
+        LOG_FILE="/var/log/vps-harden.phase1.log"
+        break
+    fi
+done
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CONFIG_DIR="${SCRIPT_DIR}/config"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 source "${SCRIPT_DIR}/lib/utils.sh"
@@ -317,11 +325,16 @@ ensure_lts_kernel_and_reboot_gate() {
     fi
 
     log_info "Pre-hardening: updating system and preparing linux-lts default boot entry."
-    run_cmd "pacman -Syu --noconfirm"
-    run_cmd "pacman -S --needed --noconfirm linux-lts"
-    ensure_grub_defaults_saved
-    run_cmd "grub-mkconfig -o ${GRUB_CONFIG_PATH}"
-    run_cmd "grub-set-default \"${GRUB_LTS_ENTRY}\""
+    if ! {
+        run_cmd "pacman -Syu --noconfirm"
+        run_cmd "pacman -S --needed --noconfirm linux-lts"
+        ensure_grub_defaults_saved
+        run_cmd "grub-mkconfig -o ${GRUB_CONFIG_PATH}"
+        run_cmd "grub-set-default \"${GRUB_LTS_ENTRY}\""
+    }; then
+        log_error "$(red "linux-lts installation failed; please review ${LOG_FILE}")"
+        exit 1
+    fi
 
     saved_entry=$(grub-editenv list 2>/dev/null | awk -F= '/^saved_entry=/{print $2}' || true)
     if [[ "${saved_entry}" != "${GRUB_LTS_ENTRY}" ]]; then
@@ -331,8 +344,12 @@ ensure_lts_kernel_and_reboot_gate() {
 
     record_pending_args "$@"
     write_continue_service
-    log_warn "Reboot required: linux-lts installed and set as default. Rebooting will auto-resume hardening via systemd. If you prefer manual resume, run: ${INSTALL_BIN} --resume $(cat ${PENDING_ARGS_FILE})"
-    exit 0
+    local resume_cmd="${INSTALL_BIN} --resume $(cat ${PENDING_ARGS_FILE})"
+    log_warn "$(yellow "Reboot required: linux-lts installed and set as default. Rebooting will auto-resume hardening via systemd.")"
+    log_info "Manual resume command: ${resume_cmd}"
+    log_info "$(green "LTS kernel installed. Rebooting in 5 seconds...")"
+    sleep 5
+    run_cmd "reboot"
 }
 
 ensure_ssh_group() {
@@ -587,26 +604,24 @@ status_report() {
 }
 
 usage() {
-    cat <<USAGE
-Usage: sudo ./harden [options]
-  --hostname <name>        Set the system hostname.
-  --user <name>            Create or ensure admin user exists and in wheel group.
-  --pubkey-file <path>     Public key file to install for the admin user.
-  --pubkey "<key>"         Public key string to install for the admin user.
-  --version                Show version and exit.
-  --ssh-port <port>        SSH port to configure (default: 2122).
-  --restrict-ssh-cidr <C>  Restrict SSH via UFW to the given CIDR.
-  --keep-ssh-22            Keep SSH port 22 allowed (transition).
-  --enable-auditd          Install and enable auditd.
-  --disable-fail2ban       Skip fail2ban configuration.
-  --disable-firewall       Skip firewall configuration (alias: --disable-ufw).
-  --disable-linger         Disable lingering for the admin user.
-  --skip-firewall-enable   Write UFW rules but do not enable the firewall.
-  --dry-run                Show actions without changing the system.
-  --non-interactive        Fail if required inputs are missing instead of prompting.
-  --resume                 Internal flag: resume after reboot; do not re-arm continuation.
-  -h, --help               Show this help.
-USAGE
+    printf "%s\n" "$(bold "Usage:") $(cyan "sudo ./harden [options]")"
+    printf "  %s\n" "$(cyan "--hostname <name>")        Set the system hostname."
+    printf "  %s\n" "$(cyan "--user <name>")            Create or ensure admin user exists and in wheel group."
+    printf "  %s\n" "$(cyan "--pubkey-file <path>")     Public key file to install for the admin user."
+    printf "  %s\n" "$(cyan "--pubkey \"<key>\"")         Public key string to install for the admin user."
+    printf "  %s\n" "$(cyan "--version")                Show version and exit."
+    printf "  %s\n" "$(cyan "--ssh-port <port>")        SSH port to configure (default: 2122)."
+    printf "  %s\n" "$(cyan "--restrict-ssh-cidr <C>")  Restrict SSH via UFW to the given CIDR."
+    printf "  %s\n" "$(cyan "--keep-ssh-22")            Keep SSH port 22 allowed (transition)."
+    printf "  %s\n" "$(cyan "--enable-auditd")          Install and enable auditd."
+    printf "  %s\n" "$(cyan "--disable-fail2ban")       Skip fail2ban configuration."
+    printf "  %s\n" "$(cyan "--disable-firewall")       Skip firewall configuration (alias: --disable-ufw)."
+    printf "  %s\n" "$(cyan "--disable-linger")         Disable lingering for the admin user."
+    printf "  %s\n" "$(cyan "--skip-firewall-enable")   Write UFW rules but do not enable the firewall."
+    printf "  %s\n" "$(cyan "--dry-run")                Show actions without changing the system."
+    printf "  %s\n" "$(cyan "--non-interactive")        Fail if required inputs are missing instead of prompting."
+    printf "  %s\n" "$(cyan "--resume")                 Internal flag: resume after reboot; do not re-arm continuation."
+    printf "  %s\n" "$(cyan "-h, --help")               Show this help."
 }
 
 verify_nf_tables_after_reboot() {

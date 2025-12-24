@@ -1,2 +1,3 @@
+# Add 8090/tcp here if Gotify is bound to a non-loopback address.
 80/tcp
 443/tcp
