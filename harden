@@ -11,7 +11,17 @@ for arg in "$@"; do
     fi
 done
 
+DEFAULT_INSTALL_PREFIX="/usr/local/lib/vps-harden"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ ! -f "${SCRIPT_DIR}/lib/utils.sh" ]]; then
+    FALLBACK_DIR="${DEFAULT_INSTALL_PREFIX}"
+    if [[ -f "${FALLBACK_DIR}/lib/utils.sh" ]]; then
+        SCRIPT_DIR="${FALLBACK_DIR}"
+    else
+        printf 'Required helper not found: %s\n' "${SCRIPT_DIR}/lib/utils.sh" >&2
+        exit 1
+    fi
+fi
 CONFIG_DIR="${SCRIPT_DIR}/config"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 source "${SCRIPT_DIR}/lib/utils.sh"
@@ -33,7 +43,7 @@ SSH_PORT=2122
 SSH_CONNECTION_INFO=""
 GRUB_LTS_ENTRY="Advanced options for Arch Linux>Arch Linux, with Linux linux-lts"
 GRUB_CONFIG_PATH="/boot/grub/grub.cfg"
-INSTALL_PREFIX="/usr/local/lib/vps-harden"
+INSTALL_PREFIX="${DEFAULT_INSTALL_PREFIX}"
 INSTALL_BIN="/usr/local/bin/vps-harden"
 STATE_DIR="/var/lib/vps-harden"
 PENDING_ARGS_FILE="${STATE_DIR}/pending_args"
