@@ -1,9 +1,36 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2025 Richard Majewski
 
-LOG_FILE="/var/log/vps-harden.log"
+LOG_FILE="${LOG_FILE:-/var/log/vps-harden.log}"
 BACKUP_PATHS=()
 DRY_RUN=${DRY_RUN:-0}
+
+if [[ -t 1 ]]; then
+    COLOR_RESET="\e[0m"
+    COLOR_BOLD="\e[1m"
+    COLOR_GREEN="\e[32m"
+    COLOR_YELLOW="\e[33m"
+    COLOR_RED="\e[31m"
+    COLOR_CYAN="\e[36m"
+else
+    COLOR_RESET=""
+    COLOR_BOLD=""
+    COLOR_GREEN=""
+    COLOR_YELLOW=""
+    COLOR_RED=""
+    COLOR_CYAN=""
+fi
+
+color_text() {
+    local color="$1"; shift
+    printf "%b%s%b" "${color}" "$*" "${COLOR_RESET}"
+}
+
+green() { color_text "${COLOR_GREEN}" "$@"; }
+yellow() { color_text "${COLOR_YELLOW}" "$@"; }
+red() { color_text "${COLOR_RED}" "$@"; }
+cyan() { color_text "${COLOR_CYAN}" "$@"; }
+bold() { color_text "${COLOR_BOLD}" "$@"; }
 
 log() {
     local level="$1"; shift
