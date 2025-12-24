@@ -480,6 +480,20 @@ next_available_system_gid() {
     return 1
 }
 
+resume_needs_restore() {
+    local arg resume_present=0
+    for arg in "$@"; do
+        if [[ "${arg}" == "--resume" ]]; then
+            resume_present=1
+            break
+        fi
+    done
+    if [[ ${resume_present} -eq 1 && $# -eq 1 ]]; then
+        return 0
+    fi
+    return 1
+}
+
 parse_args() {
     RESUME_MODE=0
     while [[ $# -gt 0 ]]; do
@@ -653,6 +667,17 @@ show_version() {
 }
 
 main() {
+    if resume_needs_restore "$@"; then
+        if [[ ! -s "${PENDING_ARGS_FILE}" ]]; then
+            log_error "Resume requested but pending args missing at ${PENDING_ARGS_FILE}"
+            exit 1
+        fi
+        local saved_args
+        saved_args=$(cat "${PENDING_ARGS_FILE}")
+        log_info "Resume requested without parameters; restoring saved arguments from ${PENDING_ARGS_FILE}"
+        eval "set -- --resume ${saved_args}"
+    fi
+
     parse_args "$@"
     preflight
     install_self
