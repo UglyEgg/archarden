@@ -457,6 +457,8 @@ install_packages() {
         pkgs+=("${pkg}")
     done < <(read_packages_from_file "${CONFIG_DIR}/packages.custom.list" 1)
 
+    apply_package_replacements pkgs
+
     if [[ ${#pkgs[@]} -eq 0 ]]; then
         log_warn "No packages defined for installation; skipping package installation"
         return
@@ -577,6 +579,68 @@ read_packages_from_file() {
     fi
 
     grep -Ev '^[[:space:]]*(#|$)' "${file}"
+}
+
+apply_package_replacements() {
+    local -n packages_ref=$1
+    local replacements_file="${CONFIG_DIR}/packages.replacements.list"
+    local -a replacements=()
+
+    while IFS= read -r line; do
+        replacements+=("${line}")
+    done < <(read_packages_from_file "${replacements_file}" 1)
+
+    if [[ ${#replacements[@]} -eq 0 ]]; then
+        return
+    fi
+
+    local entry current replacement
+    for entry in "${replacements[@]}"; do
+        read -r current replacement <<<"${entry}"
+        if [[ -z "${current}" || -z "${replacement}" ]]; then
+            log_warn "Skipping malformed replacement entry: ${entry}"
+            continue
+        fi
+        if ! package_requested "${replacement}" packages_ref; then
+            continue
+        fi
+        if package_installed "${current}"; then
+            replace_package "${current}" "${replacement}"
+        fi
+    done
+}
+
+package_requested() {
+    local target="$1"
+    local -n packages_ref=$2
+    local pkg
+    for pkg in "${packages_ref[@]}"; do
+        if [[ "${pkg}" == "${target}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+package_installed() {
+    local pkg="$1"
+    if command -v pacman >/dev/null 2>&1; then
+        pacman -Q "${pkg}" >/dev/null 2>&1
+        return $?
+    fi
+    log_error "Unsupported package manager; cannot check installation state for ${pkg}"
+    exit 1
+}
+
+replace_package() {
+    local current="$1" replacement="$2"
+    if command -v pacman >/dev/null 2>&1; then
+        log_info "Replacing installed package ${current} with ${replacement}"
+        run_cmd "pacman -R --noconfirm ${current}"
+        return
+    fi
+    log_error "Unsupported package manager; cannot replace ${current} with ${replacement}"
+    exit 1
 }
 
 record_pending_args() {
