@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Richard Majewski
 set -eEuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="${SCRIPT_DIR}/config"
+TEMPLATES_DIR="${SCRIPT_DIR}/templates"
+source "${SCRIPT_DIR}/lib/utils.sh"
 
 DRY_RUN=0
 ENABLE_FAIL2BAN=1
 ENABLE_FIREWALL=1
+ENABLE_LINGER=1
 SKIP_FIREWALL_ENABLE=0
 KEEP_SSH_22=0
 RESTRICT_SSH_CIDR=""
@@ -12,226 +20,38 @@ PUBKEY_FILE=""
 PUBKEY_VALUE=""
 ENABLE_AUDITD=0
 NON_INTERACTIVE=0
-ENABLE_LINGER=0
 SYSTEM_HOSTNAME=""
 SSH_PORT=2122
 SSH_CONNECTION_INFO=""
+GRUB_LTS_ENTRY="Advanced options for Arch Linux>Arch Linux, with Linux linux-lts"
+GRUB_CONFIG_PATH="/boot/grub/grub.cfg"
+INSTALL_PREFIX="/usr/local/lib/vps-harden"
+INSTALL_BIN="/usr/local/bin/vps-harden"
+STATE_DIR="/var/lib/vps-harden"
+PENDING_ARGS_FILE="${STATE_DIR}/pending_args"
+CONTINUE_SERVICE="/etc/systemd/system/vps-harden-continue.service"
+CONTINUE_SERVICE_TEMPLATE="${TEMPLATES_DIR}/systemd/vps-harden-continue.service"
+FINAL_LOG_FILE=""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="${SCRIPT_DIR}/config"
-TEMPLATES_DIR="${SCRIPT_DIR}/templates"
-source "${SCRIPT_DIR}/lib/utils.sh"
-
-error_trap() {
-    local exit_code=$?
-    local cmd=${BASH_COMMAND}
-    local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
-    local line=${BASH_LINENO[0]:-0}
-    log_error "Command failed with exit ${exit_code} at ${src}:${line}: ${cmd}"
-    log_error "See ${LOG_FILE} for details."
-    exit ${exit_code}
-}
-trap 'error_trap' ERR
-
-status_cmd() {
-    local cmd="$*"
-    log_info "Status: ${cmd}"
-    eval "${cmd}"
-}
-
-usage() {
-    cat <<USAGE
-Usage: sudo ./harden [options]
-  --user <name>            Create or ensure admin user exists and in wheel group.
-  --pubkey-file <path>     Public key file to install for the admin user.
-  --pubkey "<key>"         Public key string to install for the admin user.
-  --ssh-port <port>        SSH port to configure (default: 2122).
-  --restrict-ssh-cidr <C>  Restrict SSH via UFW to the given CIDR.
-  --keep-ssh-22            Keep SSH port 22 allowed (transition).
-  --enable-auditd          Install and enable auditd.
-  --disable-fail2ban       Skip fail2ban configuration.
-  --disable-firewall       Skip firewall configuration (alias: --disable-ufw).
-  --skip-firewall-enable   Write UFW rules but do not enable the firewall.
-  --enable-linger          Enable lingering for the admin user (rootless containers).
-  --hostname <name>        Set the system hostname.
-  --dry-run                Show actions without changing the system.
-  --non-interactive        Fail if required inputs are missing instead of prompting.
-  -h, --help               Show this help.
-USAGE
-}
-
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --user) USER_NAME="$2"; shift 2;;
-            --pubkey-file) PUBKEY_FILE="$2"; shift 2;;
-            --pubkey) PUBKEY_VALUE="$2"; shift 2;;
-            --ssh-port) SSH_PORT="$2"; shift 2;;
-            --restrict-ssh-cidr) RESTRICT_SSH_CIDR="$2"; shift 2;;
-            --keep-ssh-22) KEEP_SSH_22=1; shift;;
-            --enable-auditd) ENABLE_AUDITD=1; shift;;
-            --disable-fail2ban) ENABLE_FAIL2BAN=0; shift;;
-            --disable-firewall|--disable-ufw) ENABLE_FIREWALL=0; shift;;
-            --skip-firewall-enable) SKIP_FIREWALL_ENABLE=1; shift;;
-            --enable-linger) ENABLE_LINGER=1; shift;;
-            --hostname) SYSTEM_HOSTNAME="$2"; shift 2;;
-            --dry-run) DRY_RUN=1; shift;;
-            --non-interactive) NON_INTERACTIVE=1; shift;;
-            -h|--help) usage; exit 0;;
-            *) log_error "Unknown option: $1"; usage; exit 1;;
-        esac
-    done
-    export DRY_RUN
-}
-
-preflight() {
-    require_root
-    if ! grep -qi 'arch' /etc/os-release; then
-        log_error "This tool is intended for Arch Linux systems."
-        exit 1
-    fi
-    if [[ ${NON_INTERACTIVE} -eq 1 ]] && [[ -n "${USER_NAME}" ]] && [[ -z "${PUBKEY_FILE}" && -z "${PUBKEY_VALUE}" ]]; then
-        log_error "--non-interactive requires --pubkey or --pubkey-file when creating a user."
-        exit 1
-    fi
-    if ! [[ ${SSH_PORT} =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
-        log_error "Invalid --ssh-port '${SSH_PORT}'. Must be 1-65535."
-        exit 1
-    fi
-    if [[ -n "${SSH_CONNECTION:-}" ]]; then
-        SSH_CONNECTION_INFO=${SSH_CONNECTION}
-        log_info "Running under SSH from ${SSH_CONNECTION_INFO}"
-    else
-        log_warn "Not running under SSH; lockout protections limited."
-    fi
-}
-
-read_packages_from_file() {
-    local file="$1" optional="${2:-0}"
-    if [[ ! -f "${file}" ]]; then
-        if [[ "${optional}" -eq 1 ]]; then
-            log_warn "Optional package list not found: ${file}; skipping"
-            return
-        fi
-        log_error "Required package list not found: ${file}"
-        exit 1
-    fi
-
-    grep -Ev '^[[:space:]]*(#|$)' "${file}"
-}
-
-install_packages() {
-    local pkgs=()
-    while IFS= read -r pkg; do
-        pkgs+=("${pkg}")
-    done < <(read_packages_from_file "${CONFIG_DIR}/packages.list")
-
-    if [[ ${ENABLE_AUDITD} -eq 1 ]]; then
-        while IFS= read -r pkg; do
-            pkgs+=("${pkg}")
-        done < <(read_packages_from_file "${CONFIG_DIR}/packages.auditd.list" 1)
-    fi
-
-    while IFS= read -r pkg; do
-        pkgs+=("${pkg}")
-    done < <(read_packages_from_file "${CONFIG_DIR}/packages.custom.list" 1)
-
-    if [[ ${#pkgs[@]} -eq 0 ]]; then
-        log_warn "No packages defined for installation; skipping package installation"
+clear_pending_state() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would clear pending state at ${PENDING_ARGS_FILE}"
         return
     fi
-
-    log_info "Updating system and installing packages: ${pkgs[*]}"
-    run_cmd "pacman -Syu --noconfirm ${pkgs[*]}"
+    rm -f "${PENDING_ARGS_FILE}"
 }
 
-enable_timesync() {
-    run_cmd "systemctl enable --now systemd-timesyncd.service"
-}
-
-configure_journald() {
-    backup_file /etc/systemd/journald.conf
-    write_file_atomic /etc/systemd/journald.conf < "${CONFIG_DIR}/journald.conf"
-    run_cmd "systemctl restart systemd-journald"
-}
-
-configure_sysctl() {
-    backup_file /etc/sysctl.d/99-hardening.conf
-    write_file_atomic /etc/sysctl.d/99-hardening.conf < "${CONFIG_DIR}/sysctl_hardening.conf"
-    run_cmd "sysctl -p /etc/sysctl.d/99-hardening.conf"
-}
-
-configure_tmp_mount() {
-    backup_file /etc/systemd/system/tmp.mount
-    write_file_atomic /etc/systemd/system/tmp.mount < "${CONFIG_DIR}/tmp.mount"
-    run_cmd "systemctl daemon-reload"
-    run_cmd "systemctl enable --now tmp.mount"
-}
-
-report_services() {
-    log_info "Enabled services summary:"
-    status_cmd "systemctl list-unit-files --type=service --state=enabled"
-}
-
-detect_kex() {
-    if command -v ssh >/dev/null 2>&1; then
-        if ssh -Q kex 2>/dev/null | grep -q 'sntrup761x25519-sha512@openssh.com'; then
-            echo "KexAlgorithms sntrup761x25519-sha512@openssh.com"
-        fi
-    fi
-}
-
-next_available_system_gid() {
-    local gid used
-    mapfile -t used < <(getent group | awk -F: '{print $3}')
-    for gid in $(seq 999 -1 100); do
-        if ! printf '%s\n' "${used[@]}" | grep -qx "${gid}"; then
-            echo "${gid}"
-            return 0
-        fi
-    done
-    return 1
-}
-
-ensure_ssh_group() {
-    if getent group ssh >/dev/null 2>&1; then
-        local current_gid
-        current_gid=$(getent group ssh | cut -d: -f3)
-        if (( current_gid < 1000 )); then
-            log_info "SSH access group 'ssh' already exists as a system group (gid ${current_gid})"
-            return
-        fi
-
-        local new_gid
-        if ! new_gid=$(next_available_system_gid); then
-            log_error "Unable to find a free system gid (<1000) to convert 'ssh' group"
-            exit 1
-        fi
-
-        run_cmd "groupmod -g ${new_gid} ssh"
-        log_warn "Converted existing 'ssh' group to system gid ${new_gid}"
+configure_fail2ban() {
+    if [[ ${ENABLE_FAIL2BAN} -eq 0 ]]; then
+        log_warn "Fail2ban disabled by flag"
         return
     fi
-
-    run_cmd "groupadd -r ssh"
-    log_info "Created system group 'ssh' for SSH access control"
-}
-
-ensure_user_in_group() {
-    local user="$1" group="$2"
-    if ! id -u "${user}" >/dev/null 2>&1; then
-        if [[ ${DRY_RUN} -eq 1 ]]; then
-            log_info "[DRY-RUN] Would ensure ${user} is in group ${group}"
-            return
-        fi
-        log_error "User ${user} does not exist; cannot add to ${group}"
-        exit 1
+    backup_file /etc/fail2ban/jail.local
+    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/fail2ban_jail.local" | write_file_atomic /etc/fail2ban/jail.local
+    run_cmd "systemctl enable --now fail2ban.service"
+    if [ "${DRY_RUN}" -eq 0 ]; then
+        status_cmd "fail2ban-client status sshd || true"
     fi
-    if id -nG "${user}" | tr ' ' '\n' | grep -qx "${group}"; then
-        return
-    fi
-    run_cmd "usermod -aG ${group} ${user}"
-    log_info "Added ${user} to ${group}"
 }
 
 configure_hostname() {
@@ -243,6 +63,25 @@ configure_hostname() {
         return
     fi
     log_info "Hostname set to ${SYSTEM_HOSTNAME}"
+}
+
+configure_journald() {
+    backup_file /etc/systemd/journald.conf
+    write_file_atomic /etc/systemd/journald.conf < "${CONFIG_DIR}/journald.conf"
+    run_cmd "systemctl restart systemd-journald"
+}
+
+configure_podman_templates() {
+    local dest_dir=/usr/share/vps-harden/templates/containers
+    write_file_atomic /usr/share/vps-harden/README <<'EOT'
+Podman templates installed by vps-harden.
+EOT
+    write_file_atomic "${dest_dir}/nginx-proxy-manager.container" < "${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
+    write_file_atomic "${dest_dir}/podman-run-npm.sh" < "${TEMPLATES_DIR}/containers/podman-run-npm.sh"
+    write_file_atomic "${dest_dir}/gotify.container" < "${TEMPLATES_DIR}/containers/gotify.container"
+    write_file_atomic "${dest_dir}/podman-run-gotify.sh" < "${TEMPLATES_DIR}/containers/podman-run-gotify.sh"
+    run_cmd "chmod +x ${dest_dir}/podman-run-npm.sh"
+    run_cmd "chmod +x ${dest_dir}/podman-run-gotify.sh"
 }
 
 configure_sshd() {
@@ -267,55 +106,17 @@ configure_sshd() {
     fi
 }
 
-restart_sshd_and_verify() {
-    if [ "${DRY_RUN}" -eq 0 ]; then
-        run_cmd "systemctl restart sshd"
-        if ! ss -tulpn | grep -q ":${SSH_PORT}"; then
-            log_error "sshd is not listening on port ${SSH_PORT} after restart"
-            exit 1
-        fi
-    else
-        log_info "[DRY-RUN] Would restart sshd and verify port ${SSH_PORT}"
-    fi
+configure_sysctl() {
+    backup_file /etc/sysctl.d/99-hardening.conf
+    write_file_atomic /etc/sysctl.d/99-hardening.conf < "${CONFIG_DIR}/sysctl_hardening.conf"
+    run_cmd "sysctl -p /etc/sysctl.d/99-hardening.conf"
 }
 
-create_admin_user() {
-    if [[ -z "${USER_NAME}" ]]; then
-        return
-    fi
-    if id -u "${USER_NAME}" >/dev/null 2>&1; then
-        log_info "User ${USER_NAME} already exists"
-    else
-        run_cmd "useradd -m -G wheel,ssh -s /bin/bash ${USER_NAME}"
-        log_info "Created user ${USER_NAME} and added to wheel,ssh"
-    fi
-    ensure_user_in_group "${USER_NAME}" wheel
-    ensure_user_in_group "${USER_NAME}" ssh
-    if [[ ${ENABLE_LINGER} -eq 1 ]]; then
-        run_cmd "loginctl enable-linger ${USER_NAME}"
-    fi
-    if [[ -n "${PUBKEY_FILE}" ]]; then
-        PUBKEY_VALUE=$(cat "${PUBKEY_FILE}")
-    fi
-    if [[ -n "${PUBKEY_VALUE}" ]]; then
-        local ssh_dir="/home/${USER_NAME}/.ssh"
-        run_cmd "install -d -m 700 -o ${USER_NAME} -g ${USER_NAME} ${ssh_dir}"
-        local auth_keys="${ssh_dir}/authorized_keys"
-        if [ "${DRY_RUN}" -eq 0 ]; then
-            if [ ! -f "${auth_keys}" ]; then
-                touch "${auth_keys}"
-                chown "${USER_NAME}:${USER_NAME}" "${auth_keys}"
-                chmod 600 "${auth_keys}"
-            fi
-            if ! grep -qxF "${PUBKEY_VALUE}" "${auth_keys}"; then
-                echo "${PUBKEY_VALUE}" >>"${auth_keys}"
-            fi
-        else
-            log_info "[DRY-RUN] Would add key for ${USER_NAME}"
-        fi
-    else
-        log_warn "No public key provided for ${USER_NAME}; ensure key-based auth manually."
-    fi
+configure_tmp_mount() {
+    backup_file /etc/systemd/system/tmp.mount
+    write_file_atomic /etc/systemd/system/tmp.mount < "${CONFIG_DIR}/tmp.mount"
+    run_cmd "systemctl daemon-reload"
+    run_cmd "systemctl enable --now tmp.mount"
 }
 
 configure_ufw() {
@@ -384,62 +185,55 @@ configure_ufw() {
     run_cmd "ufw reload"
 }
 
-configure_fail2ban() {
-    if [[ ${ENABLE_FAIL2BAN} -eq 0 ]]; then
-        log_warn "Fail2ban disabled by flag"
+create_admin_user() {
+    if [[ -z "${USER_NAME}" ]]; then
         return
     fi
-    backup_file /etc/fail2ban/jail.local
-    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/fail2ban_jail.local" | write_file_atomic /etc/fail2ban/jail.local
-    run_cmd "systemctl enable --now fail2ban.service"
-    if [ "${DRY_RUN}" -eq 0 ]; then
-        status_cmd "fail2ban-client status sshd || true"
+    if id -u "${USER_NAME}" >/dev/null 2>&1; then
+        log_info "User ${USER_NAME} already exists"
+    else
+        run_cmd "useradd -m -G wheel,ssh -s /bin/bash ${USER_NAME}"
+        log_info "Created user ${USER_NAME} and added to wheel,ssh"
+    fi
+    ensure_user_in_group "${USER_NAME}" wheel
+    ensure_user_in_group "${USER_NAME}" ssh
+    if [[ ${ENABLE_LINGER} -eq 1 ]]; then
+        run_cmd "loginctl enable-linger ${USER_NAME}"
+    fi
+    if [[ -n "${PUBKEY_FILE}" ]]; then
+        PUBKEY_VALUE=$(cat "${PUBKEY_FILE}")
+    fi
+    if [[ -n "${PUBKEY_VALUE}" ]]; then
+        local ssh_dir="/home/${USER_NAME}/.ssh"
+        run_cmd "install -d -m 700 -o ${USER_NAME} -g ${USER_NAME} ${ssh_dir}"
+        local auth_keys="${ssh_dir}/authorized_keys"
+        if [ "${DRY_RUN}" -eq 0 ]; then
+            if [ ! -f "${auth_keys}" ]; then
+                touch "${auth_keys}"
+                chown "${USER_NAME}:${USER_NAME}" "${auth_keys}"
+                chmod 600 "${auth_keys}"
+            fi
+            if ! grep -qxF "${PUBKEY_VALUE}" "${auth_keys}"; then
+                echo "${PUBKEY_VALUE}" >>"${auth_keys}"
+            fi
+        else
+            log_info "[DRY-RUN] Would add key for ${USER_NAME}"
+        fi
+    else
+        log_warn "No public key provided for ${USER_NAME}; ensure key-based auth manually."
     fi
 }
 
-configure_podman_templates() {
-    local dest_dir=/usr/share/vps-harden/templates/containers
-    write_file_atomic /usr/share/vps-harden/README <<'EOT'
-Podman templates installed by vps-harden.
-EOT
-    write_file_atomic "${dest_dir}/nginx-proxy-manager.container" < "${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
-    write_file_atomic "${dest_dir}/podman-run-npm.sh" < "${TEMPLATES_DIR}/containers/podman-run-npm.sh"
-    run_cmd "chmod +x ${dest_dir}/podman-run-npm.sh"
-}
-
-status_report() {
-    log_info "==== STATUS REPORT ===="
-    status_cmd "ss -tulnp || true"
-    if command -v ufw >/dev/null 2>&1; then
-        status_cmd "ufw status verbose || true"
-    fi
-    if systemctl list-unit-files --type=service | grep -q fail2ban.service; then
-        status_cmd "systemctl status fail2ban --no-pager || true"
-    fi
-    report_services
-    if [[ ${#BACKUP_PATHS[@]} -gt 0 ]]; then
-        log_info "Backups created: ${BACKUP_PATHS[*]}"
+detect_kex() {
+    if command -v ssh >/dev/null 2>&1; then
+        if ssh -Q kex 2>/dev/null | grep -q 'sntrup761x25519-sha512@openssh.com'; then
+            echo "KexAlgorithms sntrup761x25519-sha512@openssh.com"
+        fi
     fi
 }
 
-main() {
-    parse_args "$@"
-    preflight
-    install_packages
-    enable_timesync
-    configure_journald
-    configure_sysctl
-    configure_tmp_mount
-    configure_hostname
-    ensure_ssh_group
-    create_admin_user
-    configure_sshd
-    restart_sshd_and_verify
-    configure_ufw
-    configure_fail2ban
-    configure_podman_templates
-    status_report
-    log_info "Hardening completed. Review status above before logging out."
+enable_timesync() {
+    run_cmd "systemctl enable --now systemd-timesyncd.service"
 }
 
 ensure_firewall_backend() {
@@ -472,4 +266,408 @@ ensure_firewall_backend() {
     exit 1
 }
 
+ensure_grub_defaults_saved() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would ensure /etc/default/grub has GRUB_DEFAULT=saved and GRUB_SAVEDEFAULT=true"
+        return
+    fi
+    if [[ ! -f /etc/default/grub ]]; then
+        log_error "/etc/default/grub not found; cannot set GRUB_DEFAULT/GRUB_SAVEDEFAULT."
+        exit 1
+    fi
+    backup_file /etc/default/grub
+    if grep -q '^GRUB_DEFAULT=' /etc/default/grub; then
+        run_cmd "sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub"
+    else
+        run_cmd "echo 'GRUB_DEFAULT=saved' >> /etc/default/grub"
+    fi
+    if grep -q '^GRUB_SAVEDEFAULT=' /etc/default/grub; then
+        run_cmd "sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub"
+    else
+        run_cmd "echo 'GRUB_SAVEDEFAULT=true' >> /etc/default/grub"
+    fi
+}
+
+ensure_lts_kernel_and_reboot_gate() {
+    if ! command -v grub-mkconfig >/dev/null 2>&1; then
+        log_error "grub-mkconfig not found; unable to set linux-lts as default."
+        exit 1
+    fi
+    if ! command -v grub-set-default >/dev/null 2>&1; then
+        log_error "grub-set-default not found; unable to set linux-lts as default."
+        exit 1
+    fi
+    if ! command -v grub-editenv >/dev/null 2>&1; then
+        log_error "grub-editenv not found; unable to verify default boot entry."
+        exit 1
+    fi
+
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would fully upgrade, install linux-lts, regenerate GRUB, set default to '${GRUB_LTS_ENTRY}', verify grub-editenv, and require reboot before hardening."
+        return
+    fi
+
+    local current_kernel saved_entry
+    current_kernel=$(uname -r)
+    saved_entry=$(grub-editenv list 2>/dev/null | awk -F= '/^saved_entry=/{print $2}' || true)
+
+    if [[ "${current_kernel}" == *-lts ]] && [[ "${saved_entry}" == "${GRUB_LTS_ENTRY}" ]]; then
+        log_info "System already booted into linux-lts with GRUB default set; continuing with hardening."
+        return
+    fi
+
+    log_info "Pre-hardening: updating system and preparing linux-lts default boot entry."
+    run_cmd "pacman -Syu --noconfirm"
+    run_cmd "pacman -S --needed --noconfirm linux-lts"
+    ensure_grub_defaults_saved
+    run_cmd "grub-mkconfig -o ${GRUB_CONFIG_PATH}"
+    run_cmd "grub-set-default \"${GRUB_LTS_ENTRY}\""
+
+    saved_entry=$(grub-editenv list 2>/dev/null | awk -F= '/^saved_entry=/{print $2}' || true)
+    if [[ "${saved_entry}" != "${GRUB_LTS_ENTRY}" ]]; then
+        log_error "Expected GRUB saved_entry '${GRUB_LTS_ENTRY}', but grub-editenv reported '${saved_entry:-<unset>}'"
+        exit 1
+    fi
+
+    record_pending_args "$@"
+    write_continue_service
+    log_warn "Reboot required: linux-lts installed and set as default. Rebooting will auto-resume hardening via systemd. If you prefer manual resume, run: ${INSTALL_BIN} --resume $(cat ${PENDING_ARGS_FILE})"
+    exit 0
+}
+
+ensure_ssh_group() {
+    if getent group ssh >/dev/null 2>&1; then
+        local current_gid
+        current_gid=$(getent group ssh | cut -d: -f3)
+        if (( current_gid < 1000 )); then
+            log_info "SSH access group 'ssh' already exists as a system group (gid ${current_gid})"
+            return
+        fi
+
+        local new_gid
+        if ! new_gid=$(next_available_system_gid); then
+            log_error "Unable to find a free system gid (<1000) to convert 'ssh' group"
+            exit 1
+        fi
+
+        run_cmd "groupmod -g ${new_gid} ssh"
+        log_warn "Converted existing 'ssh' group to system gid ${new_gid}"
+        return
+    fi
+
+    run_cmd "groupadd -r ssh"
+    log_info "Created system group 'ssh' for SSH access control"
+}
+
+ensure_user_in_group() {
+    local user="$1" group="$2"
+    if ! id -u "${user}" >/dev/null 2>&1; then
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            log_info "[DRY-RUN] Would ensure ${user} is in group ${group}"
+            return
+        fi
+        log_error "User ${user} does not exist; cannot add to ${group}"
+        exit 1
+    fi
+    if id -nG "${user}" | tr ' ' '\n' | grep -qx "${group}"; then
+        return
+    fi
+    run_cmd "usermod -aG ${group} ${user}"
+    log_info "Added ${user} to ${group}"
+}
+
+error_trap() {
+    local exit_code=$?
+    local cmd=${BASH_COMMAND}
+    local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
+    local line=${BASH_LINENO[0]:-0}
+    log_error "Command failed with exit ${exit_code} at ${src}:${line}: ${cmd}"
+    log_error "See ${LOG_FILE} for details."
+    exit ${exit_code}
+}
+trap 'error_trap' ERR
+
+final_summary() {
+    log_info "==== ✅ Hardening completed ===="
+    local summary output_dir
+    summary=$(
+        cat <<EOF
+✅ Hardening completed successfully.
+$( (( ENABLE_FIREWALL )) && echo "🔒 Firewall: configured (ufw)" || echo "🔓 Firewall: skipped")
+$( (( ENABLE_FAIL2BAN )) && echo "🛡️ Fail2ban: enabled" || echo "🛡️ Fail2ban: skipped")
+🐧 Kernel: $(uname -r)
+📦 Packages updated and installed.
+🧰 Templates installed to /usr/share/vps-harden/templates/containers
+📜 Log: ${LOG_FILE}
+EOF
+    )
+    if [[ -n "${USER_NAME}" ]] && id -u "${USER_NAME}" >/dev/null 2>&1; then
+        output_dir="/home/${USER_NAME}"
+    else
+        output_dir="/root"
+    fi
+    FINAL_LOG_FILE="${output_dir}/vps-harden.log"
+    echo "${summary}" > "${FINAL_LOG_FILE}"
+    if [[ -n "${USER_NAME}" ]] && id -u "${USER_NAME}" >/dev/null 2>&1; then
+        chown "${USER_NAME}:${USER_NAME}" "${FINAL_LOG_FILE}"
+    fi
+    log_info "Summary written to ${FINAL_LOG_FILE}"
+}
+
+install_packages() {
+    local pkgs=()
+    while IFS= read -r pkg; do
+        pkgs+=("${pkg}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/packages.list")
+
+    if [[ ${ENABLE_AUDITD} -eq 1 ]]; then
+        while IFS= read -r pkg; do
+            pkgs+=("${pkg}")
+        done < <(read_packages_from_file "${CONFIG_DIR}/packages.auditd.list" 1)
+    fi
+
+    while IFS= read -r pkg; do
+        pkgs+=("${pkg}")
+    done < <(read_packages_from_file "${CONFIG_DIR}/packages.custom.list" 1)
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        log_warn "No packages defined for installation; skipping package installation"
+        return
+    fi
+
+    log_info "Updating system and installing packages: ${pkgs[*]}"
+    run_cmd "pacman -Syu --noconfirm ${pkgs[*]}"
+}
+
+install_self() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would install archarden to ${INSTALL_PREFIX} and symlink to ${INSTALL_BIN}"
+        return
+    fi
+    if [[ "${SCRIPT_DIR}" != "${INSTALL_PREFIX}" ]]; then
+        mkdir -p "${INSTALL_PREFIX}"
+        run_cmd "cp -a ${SCRIPT_DIR}/. ${INSTALL_PREFIX}/"
+    fi
+    run_cmd "install -m 0755 ${INSTALL_PREFIX}/harden ${INSTALL_BIN}"
+}
+
+next_available_system_gid() {
+    local gid used
+    mapfile -t used < <(getent group | awk -F: '{print $3}')
+    for gid in $(seq 999 -1 100); do
+        if ! printf '%s\n' "${used[@]}" | grep -qx "${gid}"; then
+            echo "${gid}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+parse_args() {
+    RESUME_MODE=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hostname) SYSTEM_HOSTNAME="$2"; shift 2;;
+            --user) USER_NAME="$2"; shift 2;;
+            --pubkey-file) PUBKEY_FILE="$2"; shift 2;;
+            --pubkey) PUBKEY_VALUE="$2"; shift 2;;
+            --version) show_version; exit 0;;
+            --ssh-port) SSH_PORT="$2"; shift 2;;
+            --restrict-ssh-cidr) RESTRICT_SSH_CIDR="$2"; shift 2;;
+            --keep-ssh-22) KEEP_SSH_22=1; shift;;
+            --enable-auditd) ENABLE_AUDITD=1; shift;;
+            --disable-fail2ban) ENABLE_FAIL2BAN=0; shift;;
+            --disable-firewall|--disable-ufw) ENABLE_FIREWALL=0; shift;;
+            --disable-linger) ENABLE_LINGER=0; shift;;
+            --skip-firewall-enable) SKIP_FIREWALL_ENABLE=1; shift;;
+            --dry-run) DRY_RUN=1; shift;;
+            --non-interactive) NON_INTERACTIVE=1; shift;;
+            --resume) RESUME_MODE=1; shift;;
+            -h|--help) usage; exit 0;;
+            *) log_error "Unknown option: $1"; usage; exit 1;;
+        esac
+    done
+    export DRY_RUN
+}
+
+preflight() {
+    require_root
+    if [[ -z "${SYSTEM_HOSTNAME}" ]]; then
+        log_error "--hostname is required."
+        exit 1
+    fi
+    if [[ -z "${USER_NAME}" ]]; then
+        log_error "--user is required."
+        exit 1
+    fi
+    if [[ -z "${PUBKEY_FILE}" && -z "${PUBKEY_VALUE}" ]]; then
+        log_error "Either --pubkey-file or --pubkey is required."
+        exit 1
+    fi
+    if ! grep -qi 'arch' /etc/os-release; then
+        log_error "This tool is intended for Arch Linux systems."
+        exit 1
+    fi
+    if [[ ${NON_INTERACTIVE} -eq 1 ]] && [[ -n "${USER_NAME}" ]] && [[ -z "${PUBKEY_FILE}" && -z "${PUBKEY_VALUE}" ]]; then
+        log_error "--non-interactive requires --pubkey or --pubkey-file when creating a user."
+        exit 1
+    fi
+    if ! [[ ${SSH_PORT} =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
+        log_error "Invalid --ssh-port '${SSH_PORT}'. Must be 1-65535."
+        exit 1
+    fi
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        SSH_CONNECTION_INFO=${SSH_CONNECTION}
+        log_info "Running under SSH from ${SSH_CONNECTION_INFO}"
+    else
+        log_warn "Not running under SSH; lockout protections limited."
+    fi
+}
+
+read_packages_from_file() {
+    local file="$1" optional="${2:-0}"
+    if [[ ! -f "${file}" ]]; then
+        if [[ "${optional}" -eq 1 ]]; then
+            log_warn "Optional package list not found: ${file}; skipping"
+            return
+        fi
+        log_error "Required package list not found: ${file}"
+        exit 1
+    fi
+
+    grep -Ev '^[[:space:]]*(#|$)' "${file}"
+}
+
+record_pending_args() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would record pending args to ${PENDING_ARGS_FILE}: $*"
+        return
+    fi
+    mkdir -p "${STATE_DIR}"
+    printf '%q ' "$@" > "${PENDING_ARGS_FILE}"
+    echo >> "${PENDING_ARGS_FILE}"
+}
+
+report_services() {
+    log_info "Enabled services summary:"
+    status_cmd "systemctl list-unit-files --type=service --state=enabled"
+}
+
+restart_sshd_and_verify() {
+    if [ "${DRY_RUN}" -eq 0 ]; then
+        run_cmd "systemctl restart sshd"
+        if ! ss -tulpn | grep -q ":${SSH_PORT}"; then
+            log_error "sshd is not listening on port ${SSH_PORT} after restart"
+            exit 1
+        fi
+    else
+        log_info "[DRY-RUN] Would restart sshd and verify port ${SSH_PORT}"
+    fi
+}
+
+status_cmd() {
+    local cmd="$*"
+    log_info "Status: ${cmd}"
+    eval "${cmd}"
+}
+
+status_report() {
+    log_info "==== STATUS REPORT ===="
+    status_cmd "ss -tulnp || true"
+    if command -v ufw >/dev/null 2>&1; then
+        status_cmd "ufw status verbose || true"
+    fi
+    if systemctl list-unit-files --type=service | grep -q fail2ban.service; then
+        status_cmd "systemctl status fail2ban --no-pager || true"
+    fi
+    report_services
+    if [[ ${#BACKUP_PATHS[@]} -gt 0 ]]; then
+        log_info "Backups created: ${BACKUP_PATHS[*]}"
+    fi
+}
+
+usage() {
+    cat <<USAGE
+Usage: sudo ./harden [options]
+  --hostname <name>        Set the system hostname.
+  --user <name>            Create or ensure admin user exists and in wheel group.
+  --pubkey-file <path>     Public key file to install for the admin user.
+  --pubkey "<key>"         Public key string to install for the admin user.
+  --version                Show version and exit.
+  --ssh-port <port>        SSH port to configure (default: 2122).
+  --restrict-ssh-cidr <C>  Restrict SSH via UFW to the given CIDR.
+  --keep-ssh-22            Keep SSH port 22 allowed (transition).
+  --enable-auditd          Install and enable auditd.
+  --disable-fail2ban       Skip fail2ban configuration.
+  --disable-firewall       Skip firewall configuration (alias: --disable-ufw).
+  --disable-linger         Disable lingering for the admin user.
+  --skip-firewall-enable   Write UFW rules but do not enable the firewall.
+  --dry-run                Show actions without changing the system.
+  --non-interactive        Fail if required inputs are missing instead of prompting.
+  --resume                 Internal flag: resume after reboot; do not re-arm continuation.
+  -h, --help               Show this help.
+USAGE
+}
+
+verify_nf_tables_after_reboot() {
+    if [[ ${RESUME_MODE} -eq 0 ]]; then
+        return
+    fi
+    status_cmd "lsmod | grep -E 'nf_tables|nfnetlink' || true"
+}
+
+write_continue_service() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would install continuation service at ${CONTINUE_SERVICE}"
+        return
+    fi
+    render_template "${CONTINUE_SERVICE_TEMPLATE}" "${CONTINUE_SERVICE}" \
+        "PENDING_ARGS_FILE=${PENDING_ARGS_FILE}" \
+        "INSTALL_PREFIX=${INSTALL_PREFIX}"
+    run_cmd "systemctl daemon-reload"
+    run_cmd "systemctl enable vps-harden-continue.service"
+}
+
+show_version() {
+    local version_file="${SCRIPT_DIR}/VERSION"
+    if [[ -f "${version_file}" ]]; then
+        cat "${version_file}"
+    else
+        echo "unknown"
+    fi
+}
+
+main() {
+    parse_args "$@"
+    preflight
+    install_self
+    clear_pending_state
+    ensure_lts_kernel_and_reboot_gate "$@"
+    verify_nf_tables_after_reboot
+    install_packages
+    enable_timesync
+    configure_journald
+    configure_sysctl
+    configure_tmp_mount
+    configure_hostname
+    ensure_ssh_group
+    create_admin_user
+    configure_sshd
+    restart_sshd_and_verify
+    configure_ufw
+    configure_fail2ban
+    configure_podman_templates
+    status_report
+    final_summary
+}
+
 main "$@"
+
+show_version() {
+    local version_file="${SCRIPT_DIR}/VERSION"
+    if [[ -f "${version_file}" ]]; then
+        cat "${version_file}"
+    else
+        echo "unknown"
+    fi
+}
