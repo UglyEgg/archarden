@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Richard Majewski
 
 LOG_FILE="/var/log/vps-harden.log"
 BACKUP_PATHS=()
@@ -69,10 +69,24 @@ append_if_missing() {
     echo "${line}" >>"${file}"
 }
 
+render_template() {
+    local template="$1" dest="$2"
+    shift 2
+    local tmp
+    tmp=$(mktemp)
+    cp "${template}" "${tmp}"
+    for kv in "$@"; do
+        local key=${kv%%=*}
+        local val=${kv#*=}
+        sed -i "s|__${key}__|${val}|g" "${tmp}"
+    done
+    write_file_atomic "${dest}" < "${tmp}"
+    rm -f "${tmp}"
+}
+
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         log_error "This script must be run as root."
         exit 1
     fi
 }
-

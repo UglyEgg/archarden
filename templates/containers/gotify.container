@@ -1,0 +1,25 @@
+[Unit]
+Description=Gotify notification service
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=gotify
+Image=gotify/server:2.4.0
+Environment=TZ=UTC
+PublishPort=127.0.0.1:8090:80/tcp
+Volume=/var/lib/gotify/data:/app/data:Z
+ReadOnly=false
+User=1000:1000
+DropCapability=all
+SeccompProfile=default
+NotifyAccess=all
+Network=bridge
+PodmanArgs=--health-cmd "wget -q --spider http://127.0.0.1:80/health || exit 1" --health-interval 30s --health-retries 5 --health-start-period 20s --health-timeout 5s
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

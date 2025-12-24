@@ -1,0 +1,12 @@
+[Unit]
+Description=Continue vps hardening after reboot
+ConditionPathExists=__PENDING_ARGS_FILE__
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash -c 'set -euo pipefail; args=$(cat __PENDING_ARGS_FILE__); rm -f __PENDING_ARGS_FILE__; eval "set -- ${args}"; exec __INSTALL_PREFIX__/harden --resume "$@"'
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
