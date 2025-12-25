@@ -53,6 +53,8 @@ Add tools like `neovim`, `bat`, or `eza` by editing `config/packages.custom.list
 
 `config/disable-units.list` lists services that will be disabled near the end of Phase 1 if they are currently enabled. Review the WARNING header and confirm each entry is safe to disable for your host before running the hardener; blank lines and `#` comments are ignored.
 
+Static units or timers are stopped if active but not disabled; static timers such as `archlinux-keyring-wkd-sync.timer` are stopped quietly when their paired service is inactive.
+
 SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The admin user created via `--user` is added to both `wheel` (for sudo) and `ssh`; add any other accounts that need SSH access to the `ssh` group before enabling the firewall. If an `ssh` group already exists with a user-level gid, it is converted to a system gid during setup.
 
 ## What the hardener does
@@ -63,7 +65,7 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 - Mounts `/tmp` as tmpfs with `nodev,nosuid,noexec`.
 - Optionally sets the system hostname with `hostnamectl` when `--hostname` is provided.
 - Reports enabled services for review.
-- Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf`, limits logins to the dedicated `ssh` group, and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t` and the port is verified before firewall changes.
+- Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf` and `/etc/ssh/sshd_config.d/10-crypto-hardening.conf`, limits logins to the dedicated `ssh` group, and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t`, the port is verified before firewall changes, and host keys are rotated with backups under `/root/ssh-hostkey-backup/<timestamp>/` (clients must accept the new keys).
 - Configures UFW (nftables backend via `iptables-nft`, default deny incoming, allows SSH on the chosen port, allows `config/firewall_allow.list` entries by default). Optional CIDR restriction for SSH and a transition rule for port 22.
 - Sets up fail2ban with UFW actions and sshd jail on the hardened SSH port.
 - Enforces Podman OCI runtime to `runc` (system and rootless containers.conf) and installs/activates rootless quadlets under `~/.config/containers/systemd/` for NPM and Gotify using `systemctl --user` as the `--user` account.
@@ -87,6 +89,7 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 
 ## Podman runtime and quadlets
 
+- Rootless unit control prefers `systemctl --user --machine=<user>@.host ...` and falls back to `XDG_RUNTIME_DIR=/run/user/<uid>` plus `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` so non-interactive invocations succeed even without an existing session bus.
 - Quadlets are installed for the `--user` account under `~/.config/containers/systemd/` and managed with `systemctl --user` as that user (e.g., `sudo -u <user> XDG_RUNTIME_DIR=/run/user/$(id -u <user>) systemctl --user status nginx-proxy-manager.service`).
 - The OCI runtime is forced to `runc` via `/etc/containers/containers.conf` and the rootless `${HOME}/.config/containers/containers.conf` for the same user. Verify with `sudo -u <user> XDG_RUNTIME_DIR=/run/user/$(id -u <user>) podman info --format '{{.Host.OCIRuntime.Name}}'` (expected: `runc`).
 - NPM listens on `127.0.0.1:8080` (HTTP) and `127.0.0.1:8443` (HTTPS) with the admin UI on `127.0.0.1:8181`. Root-owned `systemd-socket-proxyd` units on ports 80/443 forward traffic to the rootless listener; additional public ports require their own socket/proxy pair.
@@ -116,10 +119,12 @@ Backups with timestamped `.bak` suffix are created for touched files:
 
 - `/etc/default/ufw`
 - `/etc/ssh/sshd_config.d/10-hardening.conf` (if pre-existing)
+- `/etc/ssh/sshd_config.d/10-crypto-hardening.conf` (if pre-existing)
 - `/etc/systemd/journald.conf`
 - `/etc/sysctl.d/99-hardening.conf`
 - `/etc/fail2ban/jail.local`
 - `/etc/systemd/system/tmp.mount`
+- `/root/ssh-hostkey-backup/<timestamp>/` (host keys copied before regeneration)
 
 To roll back:
 

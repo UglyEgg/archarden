@@ -7,6 +7,10 @@ PHASE0_LOG="/var/log/vps-harden.phase0.log"
 PHASE1_LOG="/var/log/vps-harden.phase1.log"
 LOG_FILE="${PHASE0_LOG}"
 CURRENT_PHASE="phase0"
+SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
+SSHD_HARDENING_DROPIN="${SSHD_CONFIG_DIR}/10-hardening.conf"
+SSHD_CRYPTO_DROPIN="${SSHD_CONFIG_DIR}/10-crypto-hardening.conf"
+SSH_HOSTKEY_BACKUP_BASE="/root/ssh-hostkey-backup"
 for arg in "$@"; do
     if [[ "${arg}" == "--resume" ]]; then
         LOG_FILE="${PHASE1_LOG}"
@@ -431,20 +435,16 @@ EOT
 }
 
 configure_sshd() {
-    local sshd_dir=/etc/ssh/sshd_config.d
-    mkdir -p "${sshd_dir}"
+    mkdir -p "${SSHD_CONFIG_DIR}"
     run_cmd "ssh-keygen -A"
-    local kex_line
-    kex_line="$(detect_kex)"
-    local dropin="${sshd_dir}/10-hardening.conf"
-    backup_file "${dropin}"
-    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/sshd_hardening.conf" | write_file_atomic "${dropin}"
-    if [[ -n "${kex_line}" ]]; then
-        append_if_missing "${dropin}" "${kex_line}"
-    fi
+    backup_file "${SSHD_HARDENING_DROPIN}"
+    backup_file "${SSHD_CRYPTO_DROPIN}"
+    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/sshd_hardening.conf" | write_file_atomic "${SSHD_HARDENING_DROPIN}"
+    write_file_atomic "${SSHD_CRYPTO_DROPIN}" < "${CONFIG_DIR}/sshd_crypto_hardening.conf"
     if [ "${DRY_RUN}" -eq 0 ]; then
         if ! sshd -t; then
             log_error "sshd configuration failed validation"
+            restore_sshd_dropins
             exit 1
         fi
     else
@@ -589,14 +589,6 @@ create_admin_user() {
     fi
 
     USER_HOME=$(getent passwd "${USER_NAME}" | cut -d: -f6)
-}
-
-detect_kex() {
-    if command -v ssh >/dev/null 2>&1; then
-        if ssh -Q kex 2>/dev/null | grep -q 'sntrup761x25519-sha512@openssh.com'; then
-            echo "KexAlgorithms sntrup761x25519-sha512@openssh.com"
-        fi
-    fi
 }
 
 enable_timesync() {
@@ -794,7 +786,59 @@ run_as_user() {
 
 user_systemctl() {
     local user="$1"; shift
-    run_as_user "${user}" "systemctl --user $*"
+    local uid runtime_dir err_file err_msg
+    uid=$(id -u "${user}")
+    runtime_dir="/run/user/${uid}"
+
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] (as ${user}) systemctl --user $*"
+        return 0
+    fi
+
+    run_cmd "install -d -m 0700 -o ${user} -g ${user} ${runtime_dir}"
+
+    if [[ ${ENABLE_LINGER} -eq 1 ]]; then
+        loginctl enable-linger "${user}" >/dev/null 2>&1 || true
+    fi
+
+    err_file=$(mktemp)
+    if ! systemctl start "user@${uid}.service" >/dev/null 2>"${err_file}"; then
+        err_msg=$(head -n1 "${err_file}")
+        if [[ -n "${err_msg}" ]]; then
+            log_warn "Could not start user@${uid}.service for ${user}: ${err_msg}"
+        fi
+    fi
+    rm -f "${err_file}"
+
+    err_file=$(mktemp)
+    if systemctl --user --machine="${user}@.host" "$@" >/dev/null 2>"${err_file}"; then
+        rm -f "${err_file}"
+        return 0
+    fi
+    err_msg=$(head -n1 "${err_file}")
+    rm -f "${err_file}"
+    log_warn "systemctl --user (machine) for ${user} failed: ${err_msg:-unknown error}; retrying with user bus"
+
+    if [[ ! -S "${runtime_dir}/bus" ]]; then
+        err_file=$(mktemp)
+        if ! systemctl start "user@${uid}.service" >/dev/null 2>"${err_file}"; then
+            err_msg=$(head -n1 "${err_file}")
+            if [[ -n "${err_msg}" ]]; then
+                log_warn "Could not ensure user@${uid}.service for ${user}: ${err_msg}"
+            fi
+        fi
+        rm -f "${err_file}"
+    fi
+
+    err_file=$(mktemp)
+    if XDG_RUNTIME_DIR="${runtime_dir}" DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" runuser -u "${user}" -- systemctl --user "$@" >/dev/null 2>"${err_file}"; then
+        rm -f "${err_file}"
+        return 0
+    fi
+    err_msg=$(head -n1 "${err_file}")
+    rm -f "${err_file}"
+    log_warn "systemctl --user for ${user} failed: ${err_msg:-unknown error}"
+    return 1
 }
 
 final_summary() {
@@ -1094,11 +1138,41 @@ disable_units_from_config() {
             log_warn "Skipping cloud-init unit ${unit}"
             continue
         fi
-        if systemctl is-enabled --quiet "${unit}" 2>/dev/null; then
-            if ! run_cmd "systemctl disable --now ${unit}"; then
-                log_warn "Failed to disable ${unit}; please review manually"
-            fi
+        local state
+        state=$(systemctl is-enabled "${unit}" 2>/dev/null | tr -d '\r' || true)
+        if [[ -z "${state}" ]]; then
+            log_warn "Could not determine enable state for ${unit}; skipping"
+            continue
         fi
+        case "${state}" in
+            enabled|enabled-runtime)
+                if ! run_cmd "systemctl disable --now ${unit}"; then
+                    log_warn "Failed to disable ${unit}; please review manually"
+                fi
+                ;;
+            indirect)
+                if ! run_cmd "systemctl disable --now ${unit}"; then
+                    log_warn "Indirect unit ${unit} could not be disabled cleanly; please review manually"
+                fi
+                ;;
+            static|disabled)
+                if systemctl is-active --quiet "${unit}"; then
+                    systemctl stop "${unit}" >/dev/null 2>&1 || true
+                fi
+                if [[ "${state}" == "static" ]]; then
+                    log_info "${unit} is static; cannot be disabled via systemctl. Skipped disable."
+                fi
+                if [[ "${unit}" == "archlinux-keyring-wkd-sync.service" ]]; then
+                    if systemctl is-active --quiet "archlinux-keyring-wkd-sync.timer"; then
+                        systemctl stop "archlinux-keyring-wkd-sync.timer" >/dev/null 2>&1 || true
+                        log_info "Stopped archlinux-keyring-wkd-sync.timer while service is inactive"
+                    fi
+                fi
+                ;;
+            *)
+                log_warn "Unexpected enable state '${state}' for ${unit}; skipped"
+                ;;
+        esac
     done < "${list_file}"
 }
 
@@ -1154,16 +1228,127 @@ verify_zram_swap() {
     fi
 }
 
+restore_sshd_dropins() {
+    local restored=0 dropin latest_backup
+    for dropin in "${SSHD_HARDENING_DROPIN}" "${SSHD_CRYPTO_DROPIN}"; do
+        latest_backup=$(ls -1t "${dropin}".*.bak 2>/dev/null | head -n1 || true)
+        if [[ -n "${latest_backup}" ]]; then
+            run_cmd "cp -p ${latest_backup} ${dropin}"
+            restored=1
+        elif [[ -f "${dropin}" ]]; then
+            run_cmd "rm -f ${dropin}"
+            restored=1
+            log_warn "Removed ${dropin} after failure; no backup was available."
+        fi
+    done
+    if [[ ${restored} -eq 1 ]]; then
+        log_warn "Restored previous sshd drop-ins from backups after failure."
+    fi
+    return ${restored}
+}
+
+log_sshd_effective_crypto() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would log effective sshd crypto configuration"
+        return
+    fi
+    status_cmd "sshd -T | grep -E 'kexalgorithms|ciphers|macs|hostkeyalgorithms|pubkeyacceptedalgorithms' || true"
+}
+
+verify_sshd_port() {
+    if ss -tulpn | grep -q ":${SSH_PORT}"; then
+        return 0
+    fi
+    return 1
+}
+
 restart_sshd_and_verify() {
     if [ "${DRY_RUN}" -eq 0 ]; then
-        run_cmd "systemctl restart sshd"
-        if ! ss -tulpn | grep -q ":${SSH_PORT}"; then
+        if run_cmd "systemctl restart sshd"; then
+            if verify_sshd_port; then
+                log_sshd_effective_crypto
+                return
+            fi
             log_error "sshd is not listening on port ${SSH_PORT} after restart"
-            exit 1
+        else
+            log_error "sshd restart failed"
         fi
+        log_warn "Attempting to restore previous sshd configuration after restart failure"
+        restore_sshd_dropins
+        if sshd -t && run_cmd "systemctl restart sshd" && verify_sshd_port; then
+            log_warn "Restored previous sshd drop-ins after restart failure"
+            log_sshd_effective_crypto
+            return
+        fi
+        log_error "Unable to recover sshd service after restart failure; manual intervention required."
+        exit 1
     else
         log_info "[DRY-RUN] Would restart sshd and verify port ${SSH_PORT}"
     fi
+}
+
+rotate_sshd_host_keys() {
+    local ts backup_dir rotation_failed=0
+    ts=$(date -u '+%Y%m%d%H%M%S')
+    backup_dir="${SSH_HOSTKEY_BACKUP_BASE}/${ts}"
+
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would backup host keys to ${backup_dir}, regenerate with ssh-keygen -A, and restart sshd"
+        return
+    fi
+
+    run_cmd "install -d -m 0700 ${backup_dir}"
+    if ls /etc/ssh/ssh_host_* >/dev/null 2>&1; then
+        run_cmd "cp -a /etc/ssh/ssh_host_* ${backup_dir}/"
+        log_info "Backed up existing ssh host keys to ${backup_dir}"
+    else
+        log_warn "No existing ssh host keys found before rotation"
+    fi
+
+    if ! run_cmd "systemctl stop sshd"; then
+        log_warn "Could not stop sshd for host key rotation; skipping rotation"
+        return
+    fi
+
+    if ! run_cmd "rm -f /etc/ssh/ssh_host_*"; then
+        rotation_failed=1
+    fi
+    if [[ ${rotation_failed} -eq 0 ]] && ! run_cmd "ssh-keygen -A"; then
+        rotation_failed=1
+    fi
+    if [[ ${rotation_failed} -eq 0 ]] && ! run_cmd "systemctl start sshd"; then
+        rotation_failed=1
+    fi
+    if [[ ${rotation_failed} -eq 0 ]] && ! sshd -t; then
+        rotation_failed=1
+    fi
+    if [[ ${rotation_failed} -eq 0 ]] && ! systemctl is-active --quiet sshd; then
+        rotation_failed=1
+    fi
+    if [[ ${rotation_failed} -eq 0 ]] && ! verify_sshd_port; then
+        log_warn "sshd port verification failed after host key rotation"
+        rotation_failed=1
+    fi
+
+    if [[ ${rotation_failed} -eq 0 ]]; then
+        log_info "sshd is listening on port ${SSH_PORT} after host key rotation"
+        log_warn "Host keys rotated. Clients will see a host key change and must update known_hosts."
+        log_sshd_effective_crypto
+        return
+    fi
+
+    log_warn "Host key rotation failed; attempting to restore previous keys from ${backup_dir}"
+    run_cmd "rm -f /etc/ssh/ssh_host_*"
+    if ls "${backup_dir}"/ssh_host_* >/dev/null 2>&1; then
+        run_cmd "cp -a ${backup_dir}/ssh_host_* /etc/ssh/"
+    fi
+    if sshd -t && run_cmd "systemctl restart sshd" && verify_sshd_port; then
+        log_warn "Restored previous sshd host keys after rotation failure."
+        log_sshd_effective_crypto
+        return
+    fi
+    log_error "Restoration after failed host key rotation did not succeed; sshd may be unavailable."
+    exit 1
 }
 
 status_cmd() {
@@ -1269,6 +1454,7 @@ main() {
     configure_podman_runtime
     configure_sshd
     restart_sshd_and_verify
+    rotate_sshd_host_keys
     configure_ufw
     configure_fail2ban
     configure_podman_templates
