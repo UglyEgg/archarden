@@ -1,0 +1,16 @@
+# WARNING: Disable only after confirming the unit is not required for your host.
+# Each line is a unit to disable; blank lines and lines beginning with # are ignored.
+archlinux-keyring-wkd-sync.service
+pacman-init.service
+systemd-boot-update.service
+systemd-boot-clear-sysfail.service
+systemd-confext.service
+systemd-homed.service
+systemd-homed-activate.service
+systemd-mountfsd.socket
+systemd-nsresourced.socket
+systemd-pstore.service
+systemd-sysext.service
+systemd-tpm2-clear.service
+systemd-userdbd.socket
+vps-harden-continue.service

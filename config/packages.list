@@ -4,8 +4,10 @@ ufw
 openssh
 fail2ban
 pacman-contrib
+runc
 podman
 slirp4netns
 fuse-overlayfs
 netavark
 aardvark-dns
+zram-generator
