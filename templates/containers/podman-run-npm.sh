@@ -6,9 +6,12 @@ set -euo pipefail
 podman run -d \
   --name npm \
   --restart unless-stopped \
-  -p 80:80 \
-  -p 443:443 \
+  -p 127.0.0.1:8080:80 \
+  -p 127.0.0.1:8443:443 \
   -p 127.0.0.1:8181:81 \
+  --memory=512m \
+  --pids-limit=512 \
+  --memory-swap=1g \
   -v npm-data:/data \
   -v npm-letsencrypt:/etc/letsencrypt \
   docker.io/jc21/nginx-proxy-manager:latest

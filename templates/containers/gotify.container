@@ -16,6 +16,8 @@ SeccompProfile=default
 NotifyAccess=all
 Network=bridge
 PodmanArgs=--health-cmd "wget -q --spider http://127.0.0.1:80/health || exit 1" --health-interval 30s --health-retries 5 --health-start-period 20s --health-timeout 5s
+Memory=128M
+PidsLimit=256
 
 [Service]
 Restart=on-failure

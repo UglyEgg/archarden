@@ -4,12 +4,15 @@ After=network.target
 
 [Container]
 Image=docker.io/jc21/nginx-proxy-manager:latest
-Network=host
+Network=slirp4netns
 PublishPort=127.0.0.1:8181:81
-PublishPort=80:80
-PublishPort=443:443
+PublishPort=127.0.0.1:8080:80
+PublishPort=127.0.0.1:8443:443
 Volume=npm-data:/data
 Volume=npm-letsencrypt:/etc/letsencrypt
+Memory=512M
+PidsLimit=512
+PodmanArgs=--memory-swap=1G
 
 [Install]
 WantedBy=default.target

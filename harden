@@ -3,10 +3,14 @@
 # Copyright (c) 2025 Richard Majewski
 set -eEuo pipefail
 
-LOG_FILE="/var/log/vps-harden.phase0.log"
+PHASE0_LOG="/var/log/vps-harden.phase0.log"
+PHASE1_LOG="/var/log/vps-harden.phase1.log"
+LOG_FILE="${PHASE0_LOG}"
+CURRENT_PHASE="phase0"
 for arg in "$@"; do
     if [[ "${arg}" == "--resume" ]]; then
-        LOG_FILE="/var/log/vps-harden.phase1.log"
+        LOG_FILE="${PHASE1_LOG}"
+        CURRENT_PHASE="phase1"
         break
     fi
 done
@@ -34,6 +38,7 @@ SKIP_FIREWALL_ENABLE=0
 KEEP_SSH_22=0
 RESTRICT_SSH_CIDR=""
 USER_NAME=""
+USER_HOME=""
 PUBKEY_FILE=""
 PUBKEY_VALUE=""
 ENABLE_AUDITD=0
@@ -102,6 +107,328 @@ EOT
     run_cmd "chmod +x ${dest_dir}/podman-run-gotify.sh"
 }
 
+ensure_containers_runtime_config() {
+    local target="$1" owner="${2:-root}" group="${3:-root}"
+    local runtime_line='runtime = "runc"'
+    local tmp in_engine=0 runtime_set=0 found_engine=0
+    tmp=$(mktemp)
+
+    run_cmd "install -d -m 0755 -o ${owner} -g ${group} $(dirname "${target}")"
+
+    if [[ -f "${target}" ]]; then
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            if [[ "${line}" =~ ^\[.*\] ]]; then
+                if [[ ${in_engine} -eq 1 && ${runtime_set} -eq 0 ]]; then
+                    echo "${runtime_line}" >>"${tmp}"
+                fi
+                in_engine=0
+            fi
+            if [[ "${line}" =~ ^\[engine\] ]]; then
+                found_engine=1
+                in_engine=1
+                runtime_set=0
+            fi
+            if [[ ${in_engine} -eq 1 && "${line}" =~ ^runtime[[:space:]]*= ]]; then
+                line=${runtime_line}
+                runtime_set=1
+            fi
+            echo "${line}" >>"${tmp}"
+        done < "${target}"
+    fi
+
+    if [[ ${in_engine} -eq 1 && ${runtime_set} -eq 0 ]]; then
+        echo "${runtime_line}" >>"${tmp}"
+    fi
+
+    if [[ ${found_engine} -eq 0 ]]; then
+        [[ -s "${tmp}" ]] && echo >>"${tmp}"
+        {
+            echo "[engine]"
+            echo "${runtime_line}"
+        } >>"${tmp}"
+    fi
+
+    write_file_atomic "${target}" < "${tmp}"
+    rm -f "${tmp}"
+    if [[ "${owner}" != "root" || "${group}" != "root" ]]; then
+        run_cmd "chown ${owner}:${group} ${target}"
+    fi
+}
+
+configure_podman_runtime() {
+    local user_home
+    user_home="${USER_HOME:-$(getent passwd "${USER_NAME}" | cut -d: -f6)}"
+    if [[ -z "${user_home}" ]]; then
+        log_error "Unable to determine home for ${USER_NAME}"
+        exit 1
+    fi
+    ensure_containers_runtime_config /etc/containers/containers.conf root root
+    ensure_containers_runtime_config "${user_home}/.config/containers/containers.conf" "${USER_NAME}" "${USER_NAME}"
+}
+
+ensure_npm_quadlet() {
+    local user_home systemd_dir target input tmp_out
+    user_home="${USER_HOME:-$(getent passwd "${USER_NAME}" | cut -d: -f6)}"
+    if [[ -z "${user_home}" ]]; then
+        log_error "Unable to determine home for ${USER_NAME}"
+        exit 1
+    fi
+    systemd_dir="${user_home}/.config/containers/systemd"
+    target="${systemd_dir}/nginx-proxy-manager.container"
+    input="${target}"
+    run_cmd "install -d -m 0755 -o ${USER_NAME} -g ${USER_NAME} ${systemd_dir}"
+    if [[ ! -f "${input}" ]]; then
+        input="${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
+    fi
+
+    tmp_out=$(mktemp)
+    local in_container=0 saw_memory=0 saw_pids=0 saw_podmanargs=0
+    local -a required_ports=("127.0.0.1:8181:81" "127.0.0.1:8080:80" "127.0.0.1:8443:443")
+    declare -A port_seen
+    for port in "${required_ports[@]}"; do
+        port_seen["${port}"]=0
+    done
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^\[.*\] ]]; then
+            if [[ ${in_container} -eq 1 ]]; then
+                for port in "${required_ports[@]}"; do
+                    if [[ ${port_seen[${port}]} -eq 0 ]]; then
+                        echo "PublishPort=${port}" >>"${tmp_out}"
+                        port_seen["${port}"]=1
+                    fi
+                done
+                if [[ ${saw_memory} -eq 0 ]]; then
+                    echo "Memory=512M" >>"${tmp_out}"
+                fi
+                if [[ ${saw_pids} -eq 0 ]]; then
+                    echo "PidsLimit=512" >>"${tmp_out}"
+                fi
+                if [[ ${saw_podmanargs} -eq 0 ]]; then
+                    echo "PodmanArgs=--memory-swap=1G" >>"${tmp_out}"
+                fi
+            fi
+            in_container=0
+        fi
+
+        if [[ ${in_container} -eq 1 ]]; then
+            if [[ "${line}" =~ ^PublishPort= ]]; then
+                local port_value
+                port_value=${line#PublishPort=}
+                if [[ "${port_value}" == "80:80" || "${port_value}" == "443:443" ]]; then
+                    continue
+                fi
+                if [[ -n "${port_seen[${port_value}]+x}" ]]; then
+                    if [[ ${port_seen[${port_value}]} -eq 1 ]]; then
+                        continue
+                    fi
+                    port_seen["${port_value}"]=1
+                fi
+                echo "PublishPort=${port_value}" >>"${tmp_out}"
+                continue
+            fi
+
+            if [[ "${line}" =~ ^Memory= ]]; then
+                if [[ ${saw_memory} -eq 1 ]]; then
+                    continue
+                fi
+                line="Memory=512M"
+                saw_memory=1
+            fi
+            if [[ "${line}" =~ ^PidsLimit= ]]; then
+                if [[ ${saw_pids} -eq 1 ]]; then
+                    continue
+                fi
+                line="PidsLimit=512"
+                saw_pids=1
+            fi
+            if [[ "${line}" =~ ^Network= ]]; then
+                if [[ "${line}" == "Network=host" ]]; then
+                    line="Network=slirp4netns"
+                fi
+            fi
+            if [[ "${line}" =~ ^PodmanArgs= ]]; then
+                if [[ ${saw_podmanargs} -eq 1 ]]; then
+                    continue
+                fi
+                saw_podmanargs=1
+                if [[ "${line}" != *"--memory-swap=1G"* ]]; then
+                    line="${line} --memory-swap=1G"
+                fi
+            fi
+        fi
+
+        echo "${line}" >>"${tmp_out}"
+
+        if [[ "${line}" == "[Container]" ]]; then
+            in_container=1
+            saw_memory=0
+            saw_pids=0
+            saw_podmanargs=0
+            for port in "${required_ports[@]}"; do
+                port_seen["${port}"]=0
+            done
+        fi
+    done < "${input}"
+
+    if [[ ${in_container} -eq 1 ]]; then
+        for port in "${required_ports[@]}"; do
+            if [[ ${port_seen[${port}]} -eq 0 ]]; then
+                echo "PublishPort=${port}" >>"${tmp_out}"
+            fi
+        done
+        if [[ ${saw_memory} -eq 0 ]]; then
+            echo "Memory=512M" >>"${tmp_out}"
+        fi
+        if [[ ${saw_pids} -eq 0 ]]; then
+            echo "PidsLimit=512" >>"${tmp_out}"
+        fi
+        if [[ ${saw_podmanargs} -eq 0 ]]; then
+            echo "PodmanArgs=--memory-swap=1G" >>"${tmp_out}"
+        fi
+    fi
+
+    write_file_atomic "${target}" < "${tmp_out}"
+    rm -f "${tmp_out}"
+    run_cmd "chown ${USER_NAME}:${USER_NAME} ${target}"
+}
+
+ensure_gotify_quadlet() {
+    local user_home systemd_dir target input tmp_out
+    user_home="${USER_HOME:-$(getent passwd "${USER_NAME}" | cut -d: -f6)}"
+    if [[ -z "${user_home}" ]]; then
+        log_error "Unable to determine home for ${USER_NAME}"
+        exit 1
+    fi
+    systemd_dir="${user_home}/.config/containers/systemd"
+    target="${systemd_dir}/gotify.container"
+    input="${target}"
+    run_cmd "install -d -m 0755 -o ${USER_NAME} -g ${USER_NAME} ${systemd_dir}"
+    if [[ ! -f "${input}" ]]; then
+        input="${TEMPLATES_DIR}/containers/gotify.container"
+    fi
+
+    tmp_out=$(mktemp)
+    local in_container=0 saw_memory=0 saw_pids=0
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^\[.*\] ]]; then
+            if [[ ${in_container} -eq 1 ]]; then
+                if [[ ${saw_memory} -eq 0 ]]; then
+                    echo "Memory=128M" >>"${tmp_out}"
+                fi
+                if [[ ${saw_pids} -eq 0 ]]; then
+                    echo "PidsLimit=256" >>"${tmp_out}"
+                fi
+            fi
+            in_container=0
+        fi
+
+        if [[ ${in_container} -eq 1 ]]; then
+            if [[ "${line}" =~ ^Memory= ]]; then
+                if [[ ${saw_memory} -eq 1 ]]; then
+                    continue
+                fi
+                line="Memory=128M"
+                saw_memory=1
+            fi
+            if [[ "${line}" =~ ^PidsLimit= ]]; then
+                if [[ ${saw_pids} -eq 1 ]]; then
+                    continue
+                fi
+                line="PidsLimit=256"
+                saw_pids=1
+            fi
+        fi
+
+        echo "${line}" >>"${tmp_out}"
+
+        if [[ "${line}" == "[Container]" ]]; then
+            in_container=1
+            saw_memory=0
+            saw_pids=0
+        fi
+    done < "${input}"
+
+    if [[ ${in_container} -eq 1 ]]; then
+        if [[ ${saw_memory} -eq 0 ]]; then
+            echo "Memory=128M" >>"${tmp_out}"
+        fi
+        if [[ ${saw_pids} -eq 0 ]]; then
+            echo "PidsLimit=256" >>"${tmp_out}"
+        fi
+    fi
+
+    write_file_atomic "${target}" < "${tmp_out}"
+    rm -f "${tmp_out}"
+    run_cmd "chown ${USER_NAME}:${USER_NAME} ${target}"
+}
+
+configure_rootless_quadlets() {
+    ensure_npm_quadlet
+    ensure_gotify_quadlet
+    if ! user_systemctl "${USER_NAME}" "daemon-reload"; then
+        log_warn "Failed to reload user systemd daemon for ${USER_NAME}"
+    fi
+    if ! user_systemctl "${USER_NAME}" "enable --now nginx-proxy-manager.service"; then
+        log_warn "Failed to enable nginx-proxy-manager.service for ${USER_NAME}"
+    fi
+    if ! user_systemctl "${USER_NAME}" "enable --now gotify.service"; then
+        log_warn "Failed to enable gotify.service for ${USER_NAME}"
+    fi
+}
+
+configure_socket_proxyd() {
+    local http_socket=/etc/systemd/system/archarden-http.socket
+    local http_service=/etc/systemd/system/archarden-http.service
+    local https_socket=/etc/systemd/system/archarden-https.socket
+    local https_service=/etc/systemd/system/archarden-https.service
+
+    backup_file "${http_socket}"
+    backup_file "${http_service}"
+    backup_file "${https_socket}"
+    backup_file "${https_service}"
+
+    write_file_atomic "${http_socket}" <<'EOT'
+[Socket]
+ListenStream=80
+Accept=no
+
+[Install]
+WantedBy=sockets.target
+EOT
+
+    write_file_atomic "${http_service}" <<'EOT'
+[Unit]
+Requires=archarden-http.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8080
+StandardInput=socket
+EOT
+
+    write_file_atomic "${https_socket}" <<'EOT'
+[Socket]
+ListenStream=443
+Accept=no
+
+[Install]
+WantedBy=sockets.target
+EOT
+
+    write_file_atomic "${https_service}" <<'EOT'
+[Unit]
+Requires=archarden-https.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8443
+StandardInput=socket
+EOT
+
+    run_cmd "systemctl daemon-reload"
+    run_cmd "systemctl enable --now archarden-http.socket archarden-https.socket"
+}
+
 configure_sshd() {
     local sshd_dir=/etc/ssh/sshd_config.d
     mkdir -p "${sshd_dir}"
@@ -127,7 +454,16 @@ configure_sshd() {
 configure_sysctl() {
     backup_file /etc/sysctl.d/99-hardening.conf
     write_file_atomic /etc/sysctl.d/99-hardening.conf < "${CONFIG_DIR}/sysctl_hardening.conf"
-    run_cmd "sysctl -p /etc/sysctl.d/99-hardening.conf"
+}
+
+configure_vm_tuning_sysctl() {
+    local dest=/etc/sysctl.d/99-vm-tuning.conf
+    backup_file "${dest}"
+    write_file_atomic "${dest}" < "${CONFIG_DIR}/vm-tuning.conf"
+}
+
+apply_sysctl_settings() {
+    run_cmd "sysctl --system"
 }
 
 configure_tmp_mount() {
@@ -135,6 +471,16 @@ configure_tmp_mount() {
     write_file_atomic /etc/systemd/system/tmp.mount < "${CONFIG_DIR}/tmp.mount"
     run_cmd "systemctl daemon-reload"
     run_cmd "systemctl enable --now tmp.mount"
+}
+
+configure_zram() {
+    local dest=/etc/systemd/zram-generator.conf
+    backup_file "${dest}"
+    write_file_atomic "${dest}" < "${CONFIG_DIR}/zram-generator.conf"
+    run_cmd "systemctl daemon-reload"
+    if ! run_cmd "systemctl restart systemd-zram-setup@zram0.service"; then
+        log_warn "systemd-zram-setup@zram0.service not available; ensure zram-generator is installed and units exist."
+    fi
 }
 
 configure_ufw() {
@@ -240,6 +586,8 @@ create_admin_user() {
     else
         log_warn "No public key provided for ${USER_NAME}; ensure key-based auth manually."
     fi
+
+    USER_HOME=$(getent passwd "${USER_NAME}" | cut -d: -f6)
 }
 
 detect_kex() {
@@ -413,6 +761,40 @@ error_trap() {
     exit ${exit_code}
 }
 trap 'error_trap' ERR
+
+switch_to_phase1_logging() {
+    if [[ "${CURRENT_PHASE}" == "phase1" ]]; then
+        return
+    fi
+    CURRENT_PHASE="phase1"
+    LOG_FILE="${PHASE1_LOG}"
+    export LOG_FILE
+    log_info "==== Starting Phase 1 actions (logging to ${LOG_FILE}) ===="
+}
+
+run_as_user() {
+    local user="$1"; shift
+    local cmd="$*"
+    local uid runtime_dir
+    uid=$(id -u "${user}")
+    runtime_dir="/run/user/${uid}"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] (as ${user}) ${cmd}"
+        return 0
+    fi
+    run_cmd "install -d -m 0700 -o ${user} -g ${user} ${runtime_dir}"
+    log_info "Running as ${user}: ${cmd}"
+    set +e
+    HOME=$(eval echo "~${user}") XDG_RUNTIME_DIR="${runtime_dir}" runuser -l "${user}" -c "${cmd}"
+    local rc=$?
+    set -e
+    return ${rc}
+}
+
+user_systemctl() {
+    local user="$1"; shift
+    run_as_user "${user}" "systemctl --user $*"
+}
 
 final_summary() {
     log_info "==== ✅ Hardening completed ===="
@@ -663,6 +1045,82 @@ report_services() {
     status_cmd "systemctl list-unit-files --type=service --state=enabled"
 }
 
+disable_units_from_config() {
+    local list_file="${CONFIG_DIR}/disable-units.list"
+    if [[ ! -f "${list_file}" ]]; then
+        log_warn "Disable list missing at ${list_file}; skipping"
+        return
+    fi
+
+    while IFS= read -r unit || [[ -n "${unit}" ]]; do
+        unit=$(echo "${unit%%#*}" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+        if [[ -z "${unit}" ]]; then
+            continue
+        fi
+        if [[ "${unit}" == *cloud-init* ]]; then
+            log_warn "Skipping cloud-init unit ${unit}"
+            continue
+        fi
+        if systemctl is-enabled --quiet "${unit}" 2>/dev/null; then
+            if ! run_cmd "systemctl disable --now ${unit}"; then
+                log_warn "Failed to disable ${unit}; please review manually"
+            fi
+        fi
+    done < "${list_file}"
+}
+
+ensure_default_target() {
+    run_cmd "systemctl set-default multi-user.target"
+    run_cmd "systemctl get-default"
+}
+
+verify_podman_runtime() {
+    local uid runtime_dir runtime_output
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would verify Podman runtime as ${USER_NAME}"
+        return
+    fi
+    uid=$(id -u "${USER_NAME}")
+    runtime_dir="/run/user/${uid}"
+    run_cmd "install -d -m 0700 -o ${USER_NAME} -g ${USER_NAME} ${runtime_dir}"
+    runtime_output=$(HOME=$(eval echo "~${USER_NAME}") XDG_RUNTIME_DIR="${runtime_dir}" runuser -l "${USER_NAME}" -c "podman info --format '{{.Host.OCIRuntime.Name}}'" 2>/dev/null || true)
+    runtime_output=$(echo "${runtime_output}" | tr -d '\r')
+    if [[ "${runtime_output}" != "runc" ]]; then
+        log_warn "Podman runtime reported '${runtime_output:-<empty>}' for ${USER_NAME}; expected 'runc'. Ensure containers.conf is applied."
+    else
+        log_info "Podman runtime verified as '${runtime_output}' for ${USER_NAME}"
+    fi
+}
+
+verify_zram_swap() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would verify zram swap priority"
+        return
+    fi
+    local swap_output zram_priority swapfile_priority
+    swap_output=$(swapon --show --noheadings --raw --bytes 2>/dev/null || true)
+    if [[ -z "${swap_output}" ]]; then
+        log_warn "No active swap devices reported; zram may not be active."
+        return
+    fi
+    zram_priority=$(echo "${swap_output}" | awk '$1 ~ /zram0/ {print $4}' | head -n1)
+    swapfile_priority=$(echo "${swap_output}" | awk '$1 ~ /swapfile/ {print $4}' | head -n1)
+    if echo "${swap_output}" | grep -q '/dev/zram0'; then
+        log_info "zram device detected in swap list."
+    else
+        log_warn "zram device /dev/zram0 not present in swap list."
+    fi
+    if [[ -n "${zram_priority}" && -n "${swapfile_priority}" ]]; then
+        if (( zram_priority > swapfile_priority )); then
+            log_info "zram priority (${zram_priority}) is higher than swapfile (${swapfile_priority})."
+        else
+            log_warn "zram priority (${zram_priority:-unset}) is not higher than swapfile (${swapfile_priority:-unset})."
+        fi
+    else
+        log_warn "Could not determine swap priorities for zram and swapfile; review swapon output manually."
+    fi
+}
+
 restart_sshd_and_verify() {
     if [ "${DRY_RUN}" -eq 0 ]; then
         run_cmd "systemctl restart sshd"
@@ -762,20 +1220,31 @@ main() {
     install_self
     clear_pending_state
     ensure_lts_kernel_and_reboot_gate "$@"
+    switch_to_phase1_logging
     verify_nf_tables_after_reboot
     install_packages
     enable_timesync
     configure_journald
     configure_sysctl
+    configure_vm_tuning_sysctl
+    apply_sysctl_settings
     configure_tmp_mount
+    configure_zram
     configure_hostname
     ensure_ssh_group
     create_admin_user
+    configure_podman_runtime
     configure_sshd
     restart_sshd_and_verify
     configure_ufw
     configure_fail2ban
     configure_podman_templates
+    configure_rootless_quadlets
+    configure_socket_proxyd
+    verify_podman_runtime
+    verify_zram_swap
+    ensure_default_target
+    disable_units_from_config
     status_report
     final_summary
 }
