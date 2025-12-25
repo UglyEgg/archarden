@@ -637,7 +637,7 @@ replace_package() {
     local current="$1" replacement="$2"
     if command -v pacman >/dev/null 2>&1; then
         log_info "Replacing installed package ${current} with ${replacement}"
-        run_cmd "pacman -R --noconfirm ${current}"
+        run_cmd "pacman -S --noconfirm --needed ${replacement}"
         return
     fi
     log_error "Unsupported package manager; cannot replace ${current} with ${replacement}"
