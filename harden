@@ -582,7 +582,8 @@ read_packages_from_file() {
 }
 
 apply_package_replacements() {
-    local -n packages_ref=$1
+    local packages_var="$1"
+    local -n packages_ref=${packages_var}
     local replacements_file="${CONFIG_DIR}/packages.replacements.list"
     local -a replacements=()
 
@@ -601,7 +602,7 @@ apply_package_replacements() {
             log_warn "Skipping malformed replacement entry: ${entry}"
             continue
         fi
-        if ! package_requested "${replacement}" packages_ref; then
+        if ! package_requested "${replacement}" "${packages_var}"; then
             continue
         fi
         if package_installed "${current}"; then
@@ -636,7 +637,11 @@ replace_package() {
     local current="$1" replacement="$2"
     if command -v pacman >/dev/null 2>&1; then
         log_info "Replacing installed package ${current} with ${replacement}"
-        run_cmd "pacman -R --noconfirm ${current}"
+        if ! run_cmd "pacman -S --noconfirm --needed ${replacement}"; then
+            log_warn "Direct install failed; retrying by removing ${current} first"
+            run_cmd "pacman -Rdd --noconfirm ${current}"
+            run_cmd "pacman -S --noconfirm --needed ${replacement}"
+        fi
         return
     fi
     log_error "Unsupported package manager; cannot replace ${current} with ${replacement}"
