@@ -582,7 +582,8 @@ read_packages_from_file() {
 }
 
 apply_package_replacements() {
-    local -n packages_ref=$1
+    local packages_var="$1"
+    local -n packages_ref=${packages_var}
     local replacements_file="${CONFIG_DIR}/packages.replacements.list"
     local -a replacements=()
 
@@ -601,7 +602,7 @@ apply_package_replacements() {
             log_warn "Skipping malformed replacement entry: ${entry}"
             continue
         fi
-        if ! package_requested "${replacement}" packages_ref; then
+        if ! package_requested "${replacement}" "${packages_var}"; then
             continue
         fi
         if package_installed "${current}"; then
