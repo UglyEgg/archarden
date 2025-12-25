@@ -52,6 +52,7 @@ INSTALL_PREFIX="${DEFAULT_INSTALL_PREFIX}"
 INSTALL_BIN="/usr/local/bin/vps-harden"
 STATE_DIR="/var/lib/vps-harden"
 PENDING_ARGS_FILE="${STATE_DIR}/pending_args"
+PERSISTED_PUBKEY_FILE="${STATE_DIR}/pubkey"
 CONTINUE_SERVICE="/etc/systemd/system/vps-harden-continue.service"
 CONTINUE_SERVICE_TEMPLATE="${TEMPLATES_DIR}/systemd/vps-harden-continue.service"
 FINAL_LOG_FILE=""
@@ -1036,7 +1037,39 @@ record_pending_args() {
         return
     fi
     mkdir -p "${STATE_DIR}"
-    printf '%q ' "$@" > "${PENDING_ARGS_FILE}"
+
+    local persisted_pubkey=""
+    if [[ -n "${PUBKEY_FILE}" ]]; then
+        if [[ ! -f "${PUBKEY_FILE}" ]]; then
+            log_error "Public key file not found: ${PUBKEY_FILE}"
+            exit 1
+        fi
+        persisted_pubkey="${PERSISTED_PUBKEY_FILE}"
+        run_cmd "install -D -m 0644 \"${PUBKEY_FILE}\" \"${persisted_pubkey}\""
+        log_info "Persisted public key for resume at ${persisted_pubkey}"
+    fi
+
+    local -a resume_args=()
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--pubkey-file" ]]; then
+            if [[ $# -lt 2 ]]; then
+                log_error "Missing value for --pubkey-file when recording pending args"
+                exit 1
+            fi
+            resume_args+=("$1")
+            if [[ -n "${persisted_pubkey}" ]]; then
+                resume_args+=("${persisted_pubkey}")
+            else
+                resume_args+=("$2")
+            fi
+            shift 2
+            continue
+        fi
+        resume_args+=("$1")
+        shift
+    done
+
+    printf '%q ' "${resume_args[@]}" > "${PENDING_ARGS_FILE}"
     echo >> "${PENDING_ARGS_FILE}"
 }
 
