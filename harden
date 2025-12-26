@@ -44,6 +44,8 @@ USER_NAME=""
 USER_HOME=""
 PODMAN_USER="podmin"
 PODMAN_HOME=""
+PODMAN_UID=""
+ENSURED_PODMIN_MANAGER=0
 PUBKEY_FILE=""
 PUBKEY_VALUE=""
 ENABLE_AUDITD=0
@@ -69,17 +71,118 @@ clear_pending_state() {
     rm -f "${PENDING_ARGS_FILE}"
 }
 
+ensure_fail2ban_sshd_local() {
+    local target=/etc/fail2ban/jail.d/sshd.local
+    local tmp_base tmp_other tmp_out current_section section_lower
+
+    tmp_base=$(mktemp)
+    tmp_other=$(mktemp)
+    tmp_out=$(mktemp)
+
+    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/fail2ban_sshd.local" > "${tmp_base}"
+
+    if [[ -f "${target}" ]]; then
+        current_section=""
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            if [[ "${line}" =~ ^\[([^]]+)\] ]]; then
+                current_section="${BASH_REMATCH[1]}"
+            fi
+            section_lower=${current_section,,}
+            if [[ "${section_lower}" != "default" && "${section_lower}" != "sshd" ]]; then
+                echo "${line}" >>"${tmp_other}"
+            fi
+        done < "${target}"
+    fi
+
+    cat "${tmp_base}" > "${tmp_out}"
+    if [[ -s "${tmp_other}" ]]; then
+        echo >>"${tmp_out}"
+        cat "${tmp_other}" >>"${tmp_out}"
+    fi
+
+    write_file_atomic "${target}" < "${tmp_out}"
+    rm -f "${tmp_base}" "${tmp_other}" "${tmp_out}"
+    run_cmd "chown root:root ${target}"
+}
+
+ensure_fail2ban_defaults_local() {
+    local target=/etc/fail2ban/jail.local
+    local tmp_base tmp_other tmp_out current_section section_lower
+
+    tmp_base=$(mktemp)
+    tmp_other=$(mktemp)
+    tmp_out=$(mktemp)
+
+    cat "${CONFIG_DIR}/fail2ban_jail.local" > "${tmp_base}"
+
+    if [[ -f "${target}" ]]; then
+        current_section=""
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            if [[ "${line}" =~ ^\[([^]]+)\] ]]; then
+                current_section="${BASH_REMATCH[1]}"
+            fi
+            section_lower=${current_section,,}
+            if [[ "${section_lower}" != "default" ]]; then
+                echo "${line}" >>"${tmp_other}"
+            fi
+        done < "${target}"
+    fi
+
+    cat "${tmp_base}" > "${tmp_out}"
+    if [[ -s "${tmp_other}" ]]; then
+        echo >>"${tmp_out}"
+        cat "${tmp_other}" >>"${tmp_out}"
+    fi
+
+    write_file_atomic "${target}" < "${tmp_out}"
+    rm -f "${tmp_base}" "${tmp_other}" "${tmp_out}"
+    run_cmd "chown root:root ${target}"
+}
+
+run_status_capture() {
+    local label="$1"; shift
+    local err_file output rc err_msg
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would run: $*"
+        return 0
+    fi
+    err_file=$(mktemp)
+    set +e
+    output=$("$@" 2>"${err_file}")
+    rc=$?
+    set -e
+    if [[ ${rc} -ne 0 ]]; then
+        err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
+        log_warn "${label} failed: ${err_msg:-unknown}"
+    else
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            log_info "${label}: ${line}"
+        done <<<"${output:-ok}"
+    fi
+    rm -f "${err_file}"
+}
+
 configure_fail2ban() {
     if [[ ${ENABLE_FAIL2BAN} -eq 0 ]]; then
         log_warn "Fail2ban disabled by flag"
         return
     fi
     backup_file /etc/fail2ban/jail.local
-    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/fail2ban_jail.local" | write_file_atomic /etc/fail2ban/jail.local
+    backup_file /etc/fail2ban/jail.d/sshd.local
+    run_cmd "install -d -m 0755 /etc/fail2ban/jail.d"
+    ensure_fail2ban_defaults_local
+    ensure_fail2ban_sshd_local
     run_cmd "systemctl enable --now fail2ban.service"
-    if [ "${DRY_RUN}" -eq 0 ]; then
-        status_cmd "fail2ban-client status sshd || true"
+    run_cmd "systemctl restart fail2ban.service"
+    if command -v ufw >/dev/null 2>&1; then
+        if ! ufw status 2>/dev/null | grep -qi "Status: active"; then
+            log_warn "ufw is not active; banaction=ufw will not take effect until ufw is enabled"
+        else
+            run_status_capture "ufw status numbered" ufw status numbered
+        fi
     fi
+    run_status_capture "fail2ban-client status" fail2ban-client status
+    run_status_capture "fail2ban-client status sshd" fail2ban-client status sshd
 }
 
 configure_hostname() {
@@ -185,13 +288,14 @@ ensure_npm_quadlet() {
     systemd_dir="${user_home}/.config/containers/systemd"
     target="${systemd_dir}/nginx-proxy-manager.container"
     input="${target}"
-    run_cmd "install -d -m 0755 -o ${PODMAN_USER} -g ${PODMAN_USER} ${systemd_dir}"
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${user_home}/.config ${user_home}/.config/containers ${systemd_dir}"
     if [[ ! -f "${input}" ]]; then
         input="${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
     fi
 
     tmp_out=$(mktemp)
     local in_container=0 saw_memory=0 saw_pids=0 saw_podmanargs=0
+    local in_install=0 saw_install=0 saw_install_wanted_by=0 saw_install_default_target=0
     local -a required_ports=("127.0.0.1:8181:81" "127.0.0.1:8080:80" "127.0.0.1:8443:443")
     declare -A port_seen
     for port in "${required_ports[@]}"; do
@@ -200,6 +304,10 @@ ensure_npm_quadlet() {
 
     while IFS= read -r line || [[ -n "${line}" ]]; do
         if [[ "${line}" =~ ^\[.*\] ]]; then
+            if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
+                echo "WantedBy=default.target" >>"${tmp_out}"
+                saw_install_default_target=1
+            fi
             if [[ ${in_container} -eq 1 ]]; then
                 for port in "${required_ports[@]}"; do
                     if [[ ${port_seen[${port}]} -eq 0 ]]; then
@@ -218,6 +326,13 @@ ensure_npm_quadlet() {
                 fi
             fi
             in_container=0
+            in_install=0
+        fi
+
+        if [[ "${line}" =~ ^\[Install\]$ ]]; then
+            in_install=1
+            saw_install=1
+            saw_install_wanted_by=0
         fi
 
         if [[ ${in_container} -eq 1 ]]; then
@@ -267,6 +382,13 @@ ensure_npm_quadlet() {
             fi
         fi
 
+        if [[ ${in_install} -eq 1 && "${line}" =~ ^WantedBy= ]]; then
+            saw_install_wanted_by=1
+            if [[ "${line#WantedBy=}" == *"default.target"* ]]; then
+                saw_install_default_target=1
+            fi
+        fi
+
         echo "${line}" >>"${tmp_out}"
 
         if [[ "${line}" == "[Container]" ]]; then
@@ -279,6 +401,11 @@ ensure_npm_quadlet() {
             done
         fi
     done < "${input}"
+
+    if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
+        echo "WantedBy=default.target" >>"${tmp_out}"
+        saw_install_default_target=1
+    fi
 
     if [[ ${in_container} -eq 1 ]]; then
         for port in "${required_ports[@]}"; do
@@ -297,9 +424,19 @@ ensure_npm_quadlet() {
         fi
     fi
 
+    if [[ ${saw_install} -eq 0 ]]; then
+        echo >>"${tmp_out}"
+        echo "[Install]" >>"${tmp_out}"
+        echo "WantedBy=default.target" >>"${tmp_out}"
+    elif [[ ${saw_install_default_target} -eq 0 ]]; then
+        echo "WantedBy=default.target" >>"${tmp_out}"
+        saw_install_default_target=1
+    fi
+
     write_file_atomic "${target}" < "${tmp_out}"
     rm -f "${tmp_out}"
     run_cmd "chown ${PODMAN_USER}:${PODMAN_USER} ${target}"
+    run_cmd "chmod 0644 ${target}"
 }
 
 ensure_gotify_quadlet() {
@@ -312,16 +449,21 @@ ensure_gotify_quadlet() {
     systemd_dir="${user_home}/.config/containers/systemd"
     target="${systemd_dir}/gotify.container"
     input="${target}"
-    run_cmd "install -d -m 0755 -o ${PODMAN_USER} -g ${PODMAN_USER} ${systemd_dir}"
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${user_home}/.config ${user_home}/.config/containers ${systemd_dir}"
     if [[ ! -f "${input}" ]]; then
         input="${TEMPLATES_DIR}/containers/gotify.container"
     fi
 
     tmp_out=$(mktemp)
     local in_container=0 saw_memory=0 saw_pids=0
+    local in_install=0 saw_install=0 saw_install_wanted_by=0 saw_install_default_target=0
 
     while IFS= read -r line || [[ -n "${line}" ]]; do
         if [[ "${line}" =~ ^\[.*\] ]]; then
+            if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
+                echo "WantedBy=default.target" >>"${tmp_out}"
+                saw_install_default_target=1
+            fi
             if [[ ${in_container} -eq 1 ]]; then
                 if [[ ${saw_memory} -eq 0 ]]; then
                     echo "Memory=128M" >>"${tmp_out}"
@@ -331,6 +473,13 @@ ensure_gotify_quadlet() {
                 fi
             fi
             in_container=0
+            in_install=0
+        fi
+
+        if [[ "${line}" =~ ^\[Install\]$ ]]; then
+            in_install=1
+            saw_install=1
+            saw_install_wanted_by=0
         fi
 
         if [[ ${in_container} -eq 1 ]]; then
@@ -350,6 +499,13 @@ ensure_gotify_quadlet() {
             fi
         fi
 
+        if [[ ${in_install} -eq 1 && "${line}" =~ ^WantedBy= ]]; then
+            saw_install_wanted_by=1
+            if [[ "${line#WantedBy=}" == *"default.target"* ]]; then
+                saw_install_default_target=1
+            fi
+        fi
+
         echo "${line}" >>"${tmp_out}"
 
         if [[ "${line}" == "[Container]" ]]; then
@@ -358,6 +514,11 @@ ensure_gotify_quadlet() {
             saw_pids=0
         fi
     done < "${input}"
+
+    if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
+        echo "WantedBy=default.target" >>"${tmp_out}"
+        saw_install_default_target=1
+    fi
 
     if [[ ${in_container} -eq 1 ]]; then
         if [[ ${saw_memory} -eq 0 ]]; then
@@ -368,22 +529,48 @@ ensure_gotify_quadlet() {
         fi
     fi
 
+    if [[ ${saw_install} -eq 0 ]]; then
+        echo >>"${tmp_out}"
+        echo "[Install]" >>"${tmp_out}"
+        echo "WantedBy=default.target" >>"${tmp_out}"
+    elif [[ ${saw_install_default_target} -eq 0 ]]; then
+        echo "WantedBy=default.target" >>"${tmp_out}"
+        saw_install_default_target=1
+    fi
+
     write_file_atomic "${target}" < "${tmp_out}"
     rm -f "${tmp_out}"
     run_cmd "chown ${PODMAN_USER}:${PODMAN_USER} ${target}"
+    run_cmd "chmod 0644 ${target}"
+}
+
+verify_quadlet_status() {
+    local service="$1"
+    ensure_podmin_user_manager
+    if podmin_systemctl status "${service}" --no-pager; then
+        return 0
+    fi
+    log_warn "Status check failed for ${service}; inspecting generated units"
+    run_cmd "systemctl --user --machine=${PODMAN_USER}@.host list-unit-files --no-pager | grep -E 'nginx-proxy-manager|gotify' || true"
+    run_cmd "ls -la /run/user/${PODMAN_UID}/systemd/generator/ | grep -E 'nginx-proxy-manager|gotify' || true"
 }
 
 configure_rootless_quadlets() {
     ensure_npm_quadlet
     ensure_gotify_quadlet
+    ensure_podmin_user_manager
     if ! podmin_systemctl daemon-reload; then
         log_warn "Failed to reload user systemd daemon for ${PODMAN_USER}; rootless services may not be active"
     fi
-    if ! podmin_systemctl enable --now nginx-proxy-manager.service; then
-        log_warn "Failed to enable nginx-proxy-manager.service for ${PODMAN_USER}; rootless services may not be active"
+    if ! podmin_systemctl start nginx-proxy-manager.service; then
+        log_warn "Failed to start nginx-proxy-manager.service for ${PODMAN_USER}; rootless services may not be active"
+    else
+        verify_quadlet_status nginx-proxy-manager.service
     fi
-    if ! podmin_systemctl enable --now gotify.service; then
-        log_warn "Failed to enable gotify.service for ${PODMAN_USER}; rootless services may not be active"
+    if ! podmin_systemctl start gotify.service; then
+        log_warn "Failed to start gotify.service for ${PODMAN_USER}; rootless services may not be active"
+    else
+        verify_quadlet_status gotify.service
     fi
 }
 
@@ -852,28 +1039,45 @@ run_as_user() {
     return ${rc}
 }
 
+ensure_podmin_user_manager() {
+    local runtime_dir err_file err_msg
+    if [[ ${ENSURED_PODMIN_MANAGER} -eq 1 ]]; then
+        return 0
+    fi
+    if [[ -n "${PODMAN_UID}" ]]; then
+        runtime_dir="/run/user/${PODMAN_UID}"
+    else
+        PODMAN_UID=$(id -u "${PODMAN_USER}")
+        runtime_dir="/run/user/${PODMAN_UID}"
+    fi
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Ensuring user manager for ${PODMAN_USER} (uid ${PODMAN_UID})"
+        return 0
+    fi
+    if ! loginctl enable-linger "${PODMAN_USER}" >/dev/null 2>&1; then
+        log_warn "Could not enable linger for ${PODMAN_USER}; rootless services may not persist across reboots"
+    fi
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${runtime_dir}"
+    err_file=$(mktemp)
+    if ! systemctl start "user@${PODMAN_UID}.service" >/dev/null 2>"${err_file}"; then
+        err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
+        if [[ -n "${err_msg}" ]]; then
+            log_warn "Could not start user@${PODMAN_UID}.service for ${PODMAN_USER}: ${err_msg}"
+        fi
+    fi
+    rm -f "${err_file}"
+    ENSURED_PODMIN_MANAGER=1
+}
+
 podmin_systemctl() {
     local uid runtime_dir err_file err_msg
     if [[ ${DRY_RUN} -eq 1 ]]; then
         log_info "[DRY-RUN] (as ${PODMAN_USER}) systemctl --user --machine=${PODMAN_USER}@.host $*"
         return 0
     fi
-    uid=$(id -u "${PODMAN_USER}")
+    ensure_podmin_user_manager
+    uid="${PODMAN_UID}"
     runtime_dir="/run/user/${uid}"
-
-    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${runtime_dir}"
-    if ! loginctl enable-linger "${PODMAN_USER}" >/dev/null 2>&1; then
-        log_warn "Could not enable linger for ${PODMAN_USER}; rootless services may not persist across reboots"
-    fi
-
-    err_file=$(mktemp)
-    if ! systemctl start "user@${uid}.service" >/dev/null 2>"${err_file}"; then
-        err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
-        if [[ -n "${err_msg}" ]]; then
-            log_warn "Could not start user@${uid}.service for ${PODMAN_USER}: ${err_msg}"
-        fi
-    fi
-    rm -f "${err_file}"
 
     err_file=$(mktemp)
     if systemctl --user --machine="${PODMAN_USER}@.host" "$@" >/dev/null 2>"${err_file}"; then
@@ -1495,20 +1699,20 @@ show_version() {
     fi
 }
 
-main() {
-    local answer_file="${SCRIPT_DIR}/harden.params" file_args cli_args cli_has_dry_run=0 file_has_dry_run=0
+    main() {
+        local answer_file="${SCRIPT_DIR}/harden.params" file_args cli_args cli_has_dry_run=0 file_has_dry_run=0
 
-    cli_args=("$@")
+        cli_args=("$@")
 
-    if [[ "$#" -gt 0 && "$1" == "--resume" ]]; then
-        :
-    else
-        if [[ -f "${answer_file}" ]]; then
-            file_args=$(<"${answer_file}")
-            log_info "Using parameter file ${answer_file}; overriding CLI arguments"
-            if [[ -n "${file_args//[[:space:]]/}" ]]; then
-                if [[ " ${file_args} " == *" --dry-run "* ]]; then
-                    file_has_dry_run=1
+        if [[ "$#" -gt 0 && "$1" == "--resume" ]]; then
+            :
+        else
+            if [[ -f "${answer_file}" ]]; then
+                file_args=$(sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "${answer_file}" | tr '\n' ' ')
+                log_info "Using parameter file ${answer_file}; overriding CLI arguments"
+                if [[ -n "${file_args//[[:space:]]/}" ]]; then
+                    if [[ " ${file_args} " == *" --dry-run "* ]]; then
+                        file_has_dry_run=1
                 fi
                 eval "set -- ${file_args}"
             else
