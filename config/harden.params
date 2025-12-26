@@ -1,0 +1,24 @@
+# Example parameter file for archarden (not auto-loaded here).
+# Copy this file to the same directory as the deployed `harden` script
+# (e.g., /usr/local/lib/vps-harden/harden.params) to activate it.
+# All lines are comments; remove the leading '# ' and place each flag
+# on a single line separated by spaces when creating a real file.
+#
+# Required values:
+# --hostname your.example.com          # Set the system hostname before changes.
+# --user admin                         # SSH/admin account to create or ensure.
+# --pubkey-file /path/to/id_ed25519.pub # Public key file to install for --user (mutually exclusive with --pubkey).
+# --pubkey "ssh-ed25519 AAAA... user@example" # Inline public key instead of --pubkey-file.
+#
+# SSH daemon options:
+# --ssh-port 2122                      # Port sshd should listen on (default 2122).
+# --restrict-ssh-cidr 203.0.113.0/24   # Restrict SSH to this CIDR via UFW (optional).
+# --keep-ssh-22                        # Keep port 22 open during transition (optional).
+#
+# Optional controls:
+# --enable-auditd                      # Install and enable auditd.
+# --disable-fail2ban                   # Skip fail2ban setup.
+# --disable-firewall                   # Skip firewall configuration (alias: --disable-ufw).
+# --skip-firewall-enable               # Write UFW rules but do not enable the firewall.
+# --dry-run                            # Preview actions without making changes.
+
