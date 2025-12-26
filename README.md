@@ -15,10 +15,16 @@ sudo ./harden --user admin --pubkey-file /path/to/id_ed25519.pub --keep-ssh-22
 Dry run preview:
 
 ```bash
-sudo ./harden --dry-run --non-interactive --skip-firewall-enable
+sudo ./harden --dry-run --skip-firewall-enable
 ```
 
 > **One-command alternative:** host the repo and use `curl -fsSL https://example.com/harden.sh | sudo bash -s -- [flags]` to invoke the script directly.
+
+## Access model
+
+- The SSH/admin account is defined by `--user`. It is added to the `ssh` group to satisfy sshd `AllowGroups`, its password is locked, and passwordless sudo is granted via `/etc/sudoers.d/90-archarden-ssh-user` (NOPASSWD). SSH access is key-only; ensure you provide a public key.
+- Rootless containers and quadlets run as the fixed `podmin` account (no CLI flag). The script creates `podmin` with home `/home/podmin`, shell `/usr/bin/nologin`, a locked password, no membership in `ssh` or `wheel`, and `sshd` explicitly denies SSH for this user.
+- All required inputs must be provided as flags; the script does not prompt for missing values. If `${SCRIPT_DIR}/harden.params` exists beside the script, its contents are used as the complete argument list and override any CLI parameters (logged when applied). Passing `--dry-run` on the command line still forces a dry run even when an answer file is present.
 
 ## Flags
 
@@ -31,10 +37,8 @@ sudo ./harden --dry-run --non-interactive --skip-firewall-enable
 - `--enable-auditd`: install and enable auditd (optional).
 - `--disable-fail2ban`: skip fail2ban setup.
 - `--disable-firewall`: skip firewall configuration entirely (alias: `--disable-ufw`).
-- `--disable-linger`: disable lingering for the admin user (enabled by default).
 - `--skip-firewall-enable`: write UFW rules but do not enable them.
 - `--dry-run`: print planned actions without changing the system.
-- `--non-interactive`: fail if required inputs (like pubkey) are missing.
 - `--version`: show the installed version of archarden.
 - `--resume`: internal flag used when the continuation service resumes after the LTS reboot.
 
@@ -65,14 +69,15 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 - Mounts `/tmp` as tmpfs with `nodev,nosuid,noexec`.
 - Optionally sets the system hostname with `hostnamectl` when `--hostname` is provided.
 - Reports enabled services for review.
-- Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf` and `/etc/ssh/sshd_config.d/10-crypto-hardening.conf`, limits logins to the dedicated `ssh` group, and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t`, the port is verified before firewall changes, and host keys are rotated with backups under `/root/ssh-hostkey-backup/<timestamp>/` (clients must accept the new keys).
+- Creates the SSH admin (`--user`) with membership in `ssh` and `wheel`, a locked password (key-only login), and passwordless sudo in `/etc/sudoers.d/90-archarden-ssh-user`.
+- Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf` and `/etc/ssh/sshd_config.d/10-crypto-hardening.conf`, limits logins to the dedicated `ssh` group, denies SSH for `podmin` (`DenyUsers podmin`), and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t`, the port is verified before firewall changes, and host keys are rotated with backups under `/root/ssh-hostkey-backup/<timestamp>/` (clients must accept the new keys).
 - Configures UFW (nftables backend via `iptables-nft`, default deny incoming, allows SSH on the chosen port, allows `config/firewall_allow.list` entries by default). Optional CIDR restriction for SSH and a transition rule for port 22.
 - Sets up fail2ban with UFW actions and sshd jail on the hardened SSH port.
-- Enforces Podman OCI runtime to `runc` (system and rootless containers.conf) and installs/activates rootless quadlets under `~/.config/containers/systemd/` for NPM and Gotify using `systemctl --user` as the `--user` account.
+- Enforces Podman OCI runtime to `runc` (system containers.conf and `/home/podmin/.config/containers/containers.conf`) and installs/activates rootless quadlets under `/home/podmin/.config/containers/systemd/` for NPM and Gotify using `systemctl --user --machine=podmin@.host` with non-interactive fallbacks.
 - Runs Nginx Proxy Manager rootlessly on `127.0.0.1:8080`/`8443` (admin UI on `127.0.0.1:8181`) and proxies privileged ports 80/443 via root-owned `systemd-socket-proxyd` units.
 - Configures Gotify rootlessly with resource limits applied via quadlet.
 - Enables zram swap via `zram-generator` (25% RAM, zstd, priority 100).
-- Ensures linux-lts is installed and set as the GRUB default, reboots once (automatically after a 5-second grace period), and auto-resumes hardening via a systemd oneshot continuation unit. A final emoji summary is printed after completion.
+- Ensures linux-lts is installed and set as the GRUB default, reboots once (automatically after a 5-second grace period), and auto-resumes hardening via a systemd oneshot continuation unit. Phase 1 ends with a final reboot (5-second delay) so socket proxies and podmin-managed quadlets come up automatically afterward.
 
 ## Safe SSH migration
 
@@ -86,14 +91,15 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 - Phase 0 (pre-reboot) actions log to `/var/log/vps-harden.phase0.log`. The resume command (for manual continuation) is also written there.
 - After the automatic reboot into the LTS kernel, the resumed run logs to `/var/log/vps-harden.phase1.log`.
 - A friendly summary is written to `/root/vps-harden.log` (or the admin user's home) after completion.
+- Phase 1 ends with a final 5-second warning and reboot so podmin-managed quadlets and the socket proxies come up automatically after the hardening run.
 
 ## Podman runtime and quadlets
 
-- Rootless unit control prefers `systemctl --user --machine=<user>@.host ...` and falls back to `XDG_RUNTIME_DIR=/run/user/<uid>` plus `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` so non-interactive invocations succeed even without an existing session bus.
-- Quadlets are installed for the `--user` account under `~/.config/containers/systemd/` and managed with `systemctl --user` as that user (e.g., `sudo -u <user> XDG_RUNTIME_DIR=/run/user/$(id -u <user>) systemctl --user status nginx-proxy-manager.service`).
-- The OCI runtime is forced to `runc` via `/etc/containers/containers.conf` and the rootless `${HOME}/.config/containers/containers.conf` for the same user. Verify with `sudo -u <user> XDG_RUNTIME_DIR=/run/user/$(id -u <user>) podman info --format '{{.Host.OCIRuntime.Name}}'` (expected: `runc`).
-- NPM listens on `127.0.0.1:8080` (HTTP) and `127.0.0.1:8443` (HTTPS) with the admin UI on `127.0.0.1:8181`. Root-owned `systemd-socket-proxyd` units on ports 80/443 forward traffic to the rootless listener; additional public ports require their own socket/proxy pair.
-- Gotify runs rootlessly with memory and PID limits applied by the quadlet; manage it the same way with `systemctl --user`.
+- Rootless unit control uses `systemctl --user --machine=podmin@.host ...` and falls back to `XDG_RUNTIME_DIR=/run/user/<uid>` plus `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` so non-interactive invocations succeed even without an existing session bus.
+- Quadlets are installed for the fixed `podmin` account under `/home/podmin/.config/containers/systemd/` and managed via the podmin user instance (e.g., `systemctl --user --machine=podmin@.host status nginx-proxy-manager.service`).
+- The OCI runtime is forced to `runc` via `/etc/containers/containers.conf` and `/home/podmin/.config/containers/containers.conf`. Verify with `runuser -u podmin -- podman info --format '{{.Host.OCIRuntime.Name}}'` (expected: `runc`).
+- Rootless (podmin-run) NPM listens on `127.0.0.1:8080` (HTTP) and `127.0.0.1:8443` (HTTPS) with the admin UI on `127.0.0.1:8181`. Root-owned `systemd-socket-proxyd` units on ports 80/443 forward traffic to the rootless listener; additional public ports require their own socket/proxy pair.
+- Gotify runs rootlessly as `podmin` with memory and PID limits applied by the quadlet; manage it the same way with `systemctl --user --machine=podmin@.host`.
 
 ## Accessing NPM admin UI
 

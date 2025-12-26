@@ -37,16 +37,16 @@ source "${SCRIPT_DIR}/lib/utils.sh"
 DRY_RUN=0
 ENABLE_FAIL2BAN=1
 ENABLE_FIREWALL=1
-ENABLE_LINGER=1
 SKIP_FIREWALL_ENABLE=0
 KEEP_SSH_22=0
 RESTRICT_SSH_CIDR=""
 USER_NAME=""
 USER_HOME=""
+PODMAN_USER="podmin"
+PODMAN_HOME=""
 PUBKEY_FILE=""
 PUBKEY_VALUE=""
 ENABLE_AUDITD=0
-NON_INTERACTIVE=0
 SYSTEM_HOSTNAME=""
 SSH_PORT=2122
 SSH_CONNECTION_INFO=""
@@ -161,27 +161,31 @@ ensure_containers_runtime_config() {
 }
 
 configure_podman_runtime() {
-    local user_home
-    user_home="${USER_HOME:-$(getent passwd "${USER_NAME}" | cut -d: -f6)}"
-    if [[ -z "${user_home}" ]]; then
-        log_error "Unable to determine home for ${USER_NAME}"
-        exit 1
+    local podmin_home
+    podmin_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
+    if [[ -z "${podmin_home}" ]]; then
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            podmin_home="/home/${PODMAN_USER}"
+        else
+            log_error "Unable to determine home for ${PODMAN_USER}"
+            exit 1
+        fi
     fi
     ensure_containers_runtime_config /etc/containers/containers.conf root root
-    ensure_containers_runtime_config "${user_home}/.config/containers/containers.conf" "${USER_NAME}" "${USER_NAME}"
+    ensure_containers_runtime_config "${podmin_home}/.config/containers/containers.conf" "${PODMAN_USER}" "${PODMAN_USER}"
 }
 
 ensure_npm_quadlet() {
     local user_home systemd_dir target input tmp_out
-    user_home="${USER_HOME:-$(getent passwd "${USER_NAME}" | cut -d: -f6)}"
+    user_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
     if [[ -z "${user_home}" ]]; then
-        log_error "Unable to determine home for ${USER_NAME}"
+        log_error "Unable to determine home for ${PODMAN_USER}"
         exit 1
     fi
     systemd_dir="${user_home}/.config/containers/systemd"
     target="${systemd_dir}/nginx-proxy-manager.container"
     input="${target}"
-    run_cmd "install -d -m 0755 -o ${USER_NAME} -g ${USER_NAME} ${systemd_dir}"
+    run_cmd "install -d -m 0755 -o ${PODMAN_USER} -g ${PODMAN_USER} ${systemd_dir}"
     if [[ ! -f "${input}" ]]; then
         input="${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
     fi
@@ -295,20 +299,20 @@ ensure_npm_quadlet() {
 
     write_file_atomic "${target}" < "${tmp_out}"
     rm -f "${tmp_out}"
-    run_cmd "chown ${USER_NAME}:${USER_NAME} ${target}"
+    run_cmd "chown ${PODMAN_USER}:${PODMAN_USER} ${target}"
 }
 
 ensure_gotify_quadlet() {
     local user_home systemd_dir target input tmp_out
-    user_home="${USER_HOME:-$(getent passwd "${USER_NAME}" | cut -d: -f6)}"
+    user_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
     if [[ -z "${user_home}" ]]; then
-        log_error "Unable to determine home for ${USER_NAME}"
+        log_error "Unable to determine home for ${PODMAN_USER}"
         exit 1
     fi
     systemd_dir="${user_home}/.config/containers/systemd"
     target="${systemd_dir}/gotify.container"
     input="${target}"
-    run_cmd "install -d -m 0755 -o ${USER_NAME} -g ${USER_NAME} ${systemd_dir}"
+    run_cmd "install -d -m 0755 -o ${PODMAN_USER} -g ${PODMAN_USER} ${systemd_dir}"
     if [[ ! -f "${input}" ]]; then
         input="${TEMPLATES_DIR}/containers/gotify.container"
     fi
@@ -366,20 +370,20 @@ ensure_gotify_quadlet() {
 
     write_file_atomic "${target}" < "${tmp_out}"
     rm -f "${tmp_out}"
-    run_cmd "chown ${USER_NAME}:${USER_NAME} ${target}"
+    run_cmd "chown ${PODMAN_USER}:${PODMAN_USER} ${target}"
 }
 
 configure_rootless_quadlets() {
     ensure_npm_quadlet
     ensure_gotify_quadlet
-    if ! user_systemctl "${USER_NAME}" "daemon-reload"; then
-        log_warn "Failed to reload user systemd daemon for ${USER_NAME}"
+    if ! podmin_systemctl daemon-reload; then
+        log_warn "Failed to reload user systemd daemon for ${PODMAN_USER}; rootless services may not be active"
     fi
-    if ! user_systemctl "${USER_NAME}" "enable --now nginx-proxy-manager.service"; then
-        log_warn "Failed to enable nginx-proxy-manager.service for ${USER_NAME}"
+    if ! podmin_systemctl enable --now nginx-proxy-manager.service; then
+        log_warn "Failed to enable nginx-proxy-manager.service for ${PODMAN_USER}; rootless services may not be active"
     fi
-    if ! user_systemctl "${USER_NAME}" "enable --now gotify.service"; then
-        log_warn "Failed to enable gotify.service for ${USER_NAME}"
+    if ! podmin_systemctl enable --now gotify.service; then
+        log_warn "Failed to enable gotify.service for ${PODMAN_USER}; rootless services may not be active"
     fi
 }
 
@@ -550,6 +554,21 @@ configure_ufw() {
     run_cmd "ufw reload"
 }
 
+ensure_admin_sudoers() {
+    local sudoers_file=/etc/sudoers.d/90-archarden-ssh-user tmp
+    tmp=$(mktemp)
+    printf "%s ALL=(ALL) NOPASSWD: ALL\n" "${USER_NAME}" > "${tmp}"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would install sudoers entry at ${sudoers_file} for ${USER_NAME}"
+        rm -f "${tmp}"
+        return
+    fi
+    backup_file "${sudoers_file}"
+    install -D -m 0440 "${tmp}" "${sudoers_file}"
+    chown root:root "${sudoers_file}"
+    rm -f "${tmp}"
+}
+
 create_admin_user() {
     if [[ -z "${USER_NAME}" ]]; then
         return
@@ -562,14 +581,21 @@ create_admin_user() {
     fi
     ensure_user_in_group "${USER_NAME}" wheel
     ensure_user_in_group "${USER_NAME}" ssh
-    if [[ ${ENABLE_LINGER} -eq 1 ]]; then
-        run_cmd "loginctl enable-linger ${USER_NAME}"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would lock password for ${USER_NAME}"
+    else
+        run_cmd "passwd -l ${USER_NAME}"
+    fi
+    USER_HOME=$(getent passwd "${USER_NAME}" | cut -d: -f6)
+    if [[ -z "${USER_HOME}" ]]; then
+        log_error "Unable to determine home for ${USER_NAME}"
+        exit 1
     fi
     if [[ -n "${PUBKEY_FILE}" ]]; then
         PUBKEY_VALUE=$(cat "${PUBKEY_FILE}")
     fi
     if [[ -n "${PUBKEY_VALUE}" ]]; then
-        local ssh_dir="/home/${USER_NAME}/.ssh"
+        local ssh_dir="${USER_HOME}/.ssh"
         run_cmd "install -d -m 700 -o ${USER_NAME} -g ${USER_NAME} ${ssh_dir}"
         local auth_keys="${ssh_dir}/authorized_keys"
         if [ "${DRY_RUN}" -eq 0 ]; then
@@ -588,7 +614,49 @@ create_admin_user() {
         log_warn "No public key provided for ${USER_NAME}; ensure key-based auth manually."
     fi
 
-    USER_HOME=$(getent passwd "${USER_NAME}" | cut -d: -f6)
+    ensure_admin_sudoers
+}
+
+ensure_podmin_user() {
+    local expected_home="/home/${PODMAN_USER}" current_home current_shell
+    if id -u "${PODMAN_USER}" >/dev/null 2>&1; then
+        log_info "Podman runtime user ${PODMAN_USER} already exists"
+        current_home=$(getent passwd "${PODMAN_USER}" | cut -d: -f6)
+        current_shell=$(getent passwd "${PODMAN_USER}" | cut -d: -f7)
+        if [[ "${current_home}" != "${expected_home}" ]]; then
+            run_cmd "usermod -d ${expected_home} -m ${PODMAN_USER}"
+        fi
+        if [[ "${current_shell}" != "/usr/bin/nologin" ]]; then
+            run_cmd "usermod -s /usr/bin/nologin ${PODMAN_USER}"
+        fi
+    else
+        run_cmd "useradd -m -d ${expected_home} -s /usr/bin/nologin ${PODMAN_USER}"
+        log_info "Created podman runtime user ${PODMAN_USER} with nologin shell"
+    fi
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would lock password for ${PODMAN_USER}"
+    else
+        run_cmd "passwd -l ${PODMAN_USER}"
+    fi
+    if getent group ssh >/dev/null 2>&1; then
+        run_cmd "gpasswd -d ${PODMAN_USER} ssh >/dev/null 2>&1 || true"
+    fi
+    if getent group wheel >/dev/null 2>&1; then
+        run_cmd "gpasswd -d ${PODMAN_USER} wheel >/dev/null 2>&1 || true"
+    fi
+    run_cmd "install -d -m 0750 -o ${PODMAN_USER} -g ${PODMAN_USER} ${expected_home}"
+    PODMAN_HOME=$(getent passwd "${PODMAN_USER}" | cut -d: -f6)
+    if [[ -z "${PODMAN_HOME}" ]]; then
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            PODMAN_HOME="${expected_home}"
+        else
+            log_error "Unable to determine home for ${PODMAN_USER}"
+            exit 1
+        fi
+    fi
+    if ! loginctl enable-linger "${PODMAN_USER}" >/dev/null 2>&1; then
+        log_warn "Could not enable linger for ${PODMAN_USER}; rootless services may not restart after reboot"
+    fi
 }
 
 enable_timesync() {
@@ -784,60 +852,57 @@ run_as_user() {
     return ${rc}
 }
 
-user_systemctl() {
-    local user="$1"; shift
+podmin_systemctl() {
     local uid runtime_dir err_file err_msg
-    uid=$(id -u "${user}")
-    runtime_dir="/run/user/${uid}"
-
     if [[ ${DRY_RUN} -eq 1 ]]; then
-        log_info "[DRY-RUN] (as ${user}) systemctl --user $*"
+        log_info "[DRY-RUN] (as ${PODMAN_USER}) systemctl --user --machine=${PODMAN_USER}@.host $*"
         return 0
     fi
+    uid=$(id -u "${PODMAN_USER}")
+    runtime_dir="/run/user/${uid}"
 
-    run_cmd "install -d -m 0700 -o ${user} -g ${user} ${runtime_dir}"
-
-    if [[ ${ENABLE_LINGER} -eq 1 ]]; then
-        loginctl enable-linger "${user}" >/dev/null 2>&1 || true
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${runtime_dir}"
+    if ! loginctl enable-linger "${PODMAN_USER}" >/dev/null 2>&1; then
+        log_warn "Could not enable linger for ${PODMAN_USER}; rootless services may not persist across reboots"
     fi
 
     err_file=$(mktemp)
     if ! systemctl start "user@${uid}.service" >/dev/null 2>"${err_file}"; then
-        err_msg=$(head -n1 "${err_file}")
+        err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
         if [[ -n "${err_msg}" ]]; then
-            log_warn "Could not start user@${uid}.service for ${user}: ${err_msg}"
+            log_warn "Could not start user@${uid}.service for ${PODMAN_USER}: ${err_msg}"
         fi
     fi
     rm -f "${err_file}"
 
     err_file=$(mktemp)
-    if systemctl --user --machine="${user}@.host" "$@" >/dev/null 2>"${err_file}"; then
+    if systemctl --user --machine="${PODMAN_USER}@.host" "$@" >/dev/null 2>"${err_file}"; then
         rm -f "${err_file}"
         return 0
     fi
-    err_msg=$(head -n1 "${err_file}")
+    err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
     rm -f "${err_file}"
-    log_warn "systemctl --user (machine) for ${user} failed: ${err_msg:-unknown error}; retrying with user bus"
+    log_warn "podmin systemctl (machine) failed: ${err_msg:-unknown}; retrying with runtime dir bus"
 
     if [[ ! -S "${runtime_dir}/bus" ]]; then
         err_file=$(mktemp)
         if ! systemctl start "user@${uid}.service" >/dev/null 2>"${err_file}"; then
-            err_msg=$(head -n1 "${err_file}")
+            err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
             if [[ -n "${err_msg}" ]]; then
-                log_warn "Could not ensure user@${uid}.service for ${user}: ${err_msg}"
+                log_warn "Could not ensure user@${uid}.service for ${PODMAN_USER}: ${err_msg}"
             fi
         fi
         rm -f "${err_file}"
     fi
 
     err_file=$(mktemp)
-    if XDG_RUNTIME_DIR="${runtime_dir}" DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" runuser -u "${user}" -- systemctl --user "$@" >/dev/null 2>"${err_file}"; then
+    if XDG_RUNTIME_DIR="${runtime_dir}" DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" runuser -u "${PODMAN_USER}" -- systemctl --user "$@" >/dev/null 2>"${err_file}"; then
         rm -f "${err_file}"
         return 0
     fi
-    err_msg=$(head -n1 "${err_file}")
+    err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
     rm -f "${err_file}"
-    log_warn "systemctl --user for ${user} failed: ${err_msg:-unknown error}"
+    log_warn "podmin systemctl (fallback) failed: ${err_msg:-unknown}; rootless services may not be active"
     return 1
 }
 
@@ -866,6 +931,16 @@ EOF
         chown "${USER_NAME}:${USER_NAME}" "${FINAL_LOG_FILE}"
     fi
     log_info "Summary written to ${FINAL_LOG_FILE}"
+}
+
+trigger_final_reboot() {
+    log_warn "==== Phase 1 completed; system will reboot in 5 seconds to finalize services and quadlets ===="
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would reboot now to complete Phase 1"
+        return
+    fi
+    sleep 5
+    run_cmd "reboot"
 }
 
 install_packages() {
@@ -948,10 +1023,8 @@ parse_args() {
             --enable-auditd) ENABLE_AUDITD=1; shift;;
             --disable-fail2ban) ENABLE_FAIL2BAN=0; shift;;
             --disable-firewall|--disable-ufw) ENABLE_FIREWALL=0; shift;;
-            --disable-linger) ENABLE_LINGER=0; shift;;
             --skip-firewall-enable) SKIP_FIREWALL_ENABLE=1; shift;;
             --dry-run) DRY_RUN=1; shift;;
-            --non-interactive) NON_INTERACTIVE=1; shift;;
             --resume) RESUME_MODE=1; shift;;
             -h|--help) usage; exit 0;;
             *) log_error "Unknown option: $1"; usage; exit 1;;
@@ -976,10 +1049,6 @@ preflight() {
     fi
     if ! grep -qi 'arch' /etc/os-release; then
         log_error "This tool is intended for Arch Linux systems."
-        exit 1
-    fi
-    if [[ ${NON_INTERACTIVE} -eq 1 ]] && [[ -n "${USER_NAME}" ]] && [[ -z "${PUBKEY_FILE}" && -z "${PUBKEY_VALUE}" ]]; then
-        log_error "--non-interactive requires --pubkey or --pubkey-file when creating a user."
         exit 1
     fi
     if ! [[ ${SSH_PORT} =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
@@ -1184,18 +1253,18 @@ ensure_default_target() {
 verify_podman_runtime() {
     local uid runtime_dir runtime_output
     if [[ ${DRY_RUN} -eq 1 ]]; then
-        log_info "[DRY-RUN] Would verify Podman runtime as ${USER_NAME}"
+        log_info "[DRY-RUN] Would verify Podman runtime as ${PODMAN_USER}"
         return
     fi
-    uid=$(id -u "${USER_NAME}")
+    uid=$(id -u "${PODMAN_USER}")
     runtime_dir="/run/user/${uid}"
-    run_cmd "install -d -m 0700 -o ${USER_NAME} -g ${USER_NAME} ${runtime_dir}"
-    runtime_output=$(HOME=$(eval echo "~${USER_NAME}") XDG_RUNTIME_DIR="${runtime_dir}" runuser -l "${USER_NAME}" -c "podman info --format '{{.Host.OCIRuntime.Name}}'" 2>/dev/null || true)
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${runtime_dir}"
+    runtime_output=$(HOME="${PODMAN_HOME:-$(eval echo \"~${PODMAN_USER}\")}" XDG_RUNTIME_DIR="${runtime_dir}" runuser -u "${PODMAN_USER}" -- podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)
     runtime_output=$(echo "${runtime_output}" | tr -d '\r')
     if [[ "${runtime_output}" != "runc" ]]; then
-        log_warn "Podman runtime reported '${runtime_output:-<empty>}' for ${USER_NAME}; expected 'runc'. Ensure containers.conf is applied."
+        log_warn "Podman runtime reported '${runtime_output:-<empty>}' for ${PODMAN_USER}; expected 'runc'. Ensure containers.conf is applied."
     else
-        log_info "Podman runtime verified as '${runtime_output}' for ${USER_NAME}"
+        log_info "Podman runtime verified as '${runtime_output}' for ${PODMAN_USER}"
     fi
 }
 
@@ -1374,23 +1443,28 @@ status_report() {
 
 usage() {
     printf "%s\n" "$(bold "Usage:") $(cyan "sudo ./harden [options]")"
-    printf "  %s\n" "$(cyan "--hostname <name>")        Set the system hostname."
-    printf "  %s\n" "$(cyan "--user <name>")            Create or ensure admin user exists and in wheel group."
-    printf "  %s\n" "$(cyan "--pubkey-file <path>")     Public key file to install for the admin user."
-    printf "  %s\n" "$(cyan "--pubkey \"<key>\"")         Public key string to install for the admin user."
-    printf "  %s\n" "$(cyan "--version")                Show version and exit."
-    printf "  %s\n" "$(cyan "--ssh-port <port>")        SSH port to configure (default: 2122)."
-    printf "  %s\n" "$(cyan "--restrict-ssh-cidr <C>")  Restrict SSH via UFW to the given CIDR."
-    printf "  %s\n" "$(cyan "--keep-ssh-22")            Keep SSH port 22 allowed (transition)."
-    printf "  %s\n" "$(cyan "--enable-auditd")          Install and enable auditd."
-    printf "  %s\n" "$(cyan "--disable-fail2ban")       Skip fail2ban configuration."
-    printf "  %s\n" "$(cyan "--disable-firewall")       Skip firewall configuration (alias: --disable-ufw)."
-    printf "  %s\n" "$(cyan "--disable-linger")         Disable lingering for the admin user."
-    printf "  %s\n" "$(cyan "--skip-firewall-enable")   Write UFW rules but do not enable the firewall."
-    printf "  %s\n" "$(cyan "--dry-run")                Show actions without changing the system."
-    printf "  %s\n" "$(cyan "--non-interactive")        Fail if required inputs are missing instead of prompting."
-    printf "  %s\n" "$(cyan "--resume")                 Internal flag: resume after reboot; do not re-arm continuation."
-    printf "  %s\n" "$(cyan "-h, --help")               Show this help."
+    printf "\n%s\n" "$(bold "$(green "Required")")"
+    printf "  %s\n" "$(cyan "--hostname <name>")          Set the system hostname."
+    printf "  %s\n" "$(cyan "--user <name>")              Create or ensure admin user exists and in wheel group."
+    printf "  %s\n" "$(cyan "--pubkey-file <path>")       Public key file to install for the admin user."
+    printf "  %s\n" "$(cyan "--pubkey \"<key>\"")           Public key string to install for the admin user."
+
+    printf "\n%s\n" "$(bold "$(green "SSH")")"
+    printf "  %s\n" "$(cyan "--ssh-port <port>")          SSH port to configure (default: 2122)."
+    printf "  %s\n" "$(cyan "--restrict-ssh-cidr <C>")    Restrict SSH via UFW to the given CIDR."
+    printf "  %s\n" "$(cyan "--keep-ssh-22")              Keep port 22 allowed (transition)."
+
+    printf "\n%s\n" "$(bold "$(green "Optional services")")"
+    printf "  %s\n" "$(cyan "--enable-auditd")            Install and enable auditd."
+    printf "  %s\n" "$(cyan "--disable-fail2ban")         Skip fail2ban configuration."
+    printf "  %s\n" "$(cyan "--disable-firewall")         Skip firewall configuration (alias: --disable-ufw)."
+    printf "  %s\n" "$(cyan "--skip-firewall-enable")     Write UFW rules but do not enable the firewall."
+
+    printf "\n%s\n" "$(bold "$(green "Behavior")")"
+    printf "  %s\n" "$(cyan "--dry-run")                  Show actions without changing the system."
+    printf "  %s\n" "$(cyan "--resume")                   Internal flag: resume after reboot; do not re-arm continuation."
+    printf "  %s\n" "$(cyan "--version")                  Show version and exit."
+    printf "  %s\n" "$(cyan "-h, --help")                 Show this help."
 }
 
 verify_nf_tables_after_reboot() {
@@ -1422,6 +1496,37 @@ show_version() {
 }
 
 main() {
+    local answer_file="${SCRIPT_DIR}/harden.params" file_args cli_args cli_has_dry_run=0 file_has_dry_run=0
+
+    cli_args=("$@")
+
+    if [[ "$#" -gt 0 && "$1" == "--resume" ]]; then
+        :
+    else
+        if [[ -f "${answer_file}" ]]; then
+            file_args=$(<"${answer_file}")
+            log_info "Using parameter file ${answer_file}; overriding CLI arguments"
+            if [[ -n "${file_args//[[:space:]]/}" ]]; then
+                if [[ " ${file_args} " == *" --dry-run "* ]]; then
+                    file_has_dry_run=1
+                fi
+                eval "set -- ${file_args}"
+            else
+                set --
+            fi
+        fi
+    fi
+
+    for arg in "${cli_args[@]}"; do
+        if [[ "${arg}" == "--dry-run" ]]; then
+            cli_has_dry_run=1
+            break
+        fi
+    done
+    if [[ ${cli_has_dry_run} -eq 1 && ${file_has_dry_run} -eq 0 ]]; then
+        set -- "$@" --dry-run
+    fi
+
     if resume_needs_restore "$@"; then
         if [[ ! -s "${PENDING_ARGS_FILE}" ]]; then
             log_error "Resume requested but pending args missing at ${PENDING_ARGS_FILE}"
@@ -1451,6 +1556,7 @@ main() {
     configure_hostname
     ensure_ssh_group
     create_admin_user
+    ensure_podmin_user
     configure_podman_runtime
     configure_sshd
     restart_sshd_and_verify
@@ -1466,6 +1572,7 @@ main() {
     disable_units_from_config
     status_report
     final_summary
+    trigger_final_reboot
 }
 
 main "$@"
