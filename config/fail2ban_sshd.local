@@ -15,3 +15,13 @@ bantime  = 1h
 
 # Optional: never ban yourself/your networks (add your real mgmt IP/VPN ranges)
 ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+port = __SSH_PORT__
+
+# Optional but recommended on a VPS: catch more SSH failure patterns
+filter = sshd[mode=aggressive]
+
+# If you ever suspect the journal match is wrong, force it explicitly:
+# journalmatch = _SYSTEMD_UNIT=sshd.service + _COMM=sshd
