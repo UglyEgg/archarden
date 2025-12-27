@@ -76,6 +76,8 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 - Enforces Podman OCI runtime to `runc` (system containers.conf and `/home/podmin/.config/containers/containers.conf`) and installs/activates rootless quadlets under `/home/podmin/.config/containers/systemd/` for NPM and Gotify using `systemctl --user --machine=podmin@.host` with non-interactive fallbacks.
 - Runs Nginx Proxy Manager rootlessly on `127.0.0.1:8080`/`8443` (admin UI on `127.0.0.1:8181`) and proxies privileged ports 80/443 via root-owned `systemd-socket-proxyd` units.
 - Configures Gotify rootlessly with resource limits applied via quadlet.
+- Provisions WireGuard (`wg0`) with default peers (`laptop`, `phone`) and stores client configs under `/root/wireguard/clients`; SSH remains reachable on the hardened port even if WireGuard is down.
+- Installs rootless Uptime Kuma (podmin) with VPN-only UFW rules, plus Gotify-based daily OS reports and weekly container update scans.
 - Enables zram swap via `zram-generator` (25% RAM, zstd, priority 100).
 - Ensures linux-lts is installed and set as the GRUB default, reboots once (automatically after a 5-second grace period), and auto-resumes hardening via a systemd oneshot continuation unit. Phase 1 ends with a final reboot (5-second delay) so socket proxies and podmin-managed quadlets come up automatically afterward.
 
@@ -114,6 +116,23 @@ Then browse to `http://localhost:8181` locally. Public ports 80/443 are handled 
 ## Gotify connectivity
 
 Gotify is bound to `127.0.0.1:8090` by default so it is reachable locally or over an SSH tunnel (e.g., `ssh -L 8090:127.0.0.1:8090 user@server -p 2122`). No additional firewall rules are required in this mode. If you rebind Gotify to a non-loopback address, add the desired port (e.g., `8090/tcp`) to `config/firewall_allow.list` before running the hardener so UFW allows inbound access.
+
+## WireGuard access
+
+- WireGuard is provisioned at `wg0` with server address `10.66.66.1/24` and listen port `51820/udp`. Server keys live under `/etc/wireguard/keys/` (0600 root) and the config is at `/etc/wireguard/wg0.conf`.
+- Two peers are created automatically (`laptop`, `phone`) with fixed IPs `10.66.66.2/32` and `10.66.66.3/32`. Client configs are written to `/root/wireguard/clients/*.conf` (0600 root) and include the detected public IPv4 endpoint on port `51820`.
+- UFW opens `51820/udp` and additionally allows the NPM admin UI (`port 81/tcp`) and Uptime Kuma (`port 3001/tcp`) only on `wg0`, keeping them private. SSH remains reachable on the hardened SSH port (default `2122`) even if WireGuard is unavailable.
+
+## Uptime Kuma (VPN-only)
+
+- A rootless quadlet for podmin runs Uptime Kuma from `docker.io/louislam/uptime-kuma:2` with data in `/home/podmin/.local/share/uptime-kuma`. The service listens on `3001/tcp` and is intended to be accessed via WireGuard; UFW only permits it on `wg0`.
+- Quadlet auto-update metadata (`AutoUpdate=registry`) is set so `podman auto-update --dry-run` can report available images.
+
+## Gotify notifications and scheduled reports
+
+- Configure Gotify by editing `/etc/archarden/notify-gotify.env` (0600 root). Set `GOTIFY_URL`, `GOTIFY_TOKEN`, and optionally `GOTIFY_PRIORITY` (default 5). If the URL/token is empty, notification scripts exit quietly.
+- Daily OS update/vulnerability reports run via `archarden-os-report.timer` (03:15 local) and send combined `checkupdates` + `arch-audit` output to Gotify.
+- Weekly container update scans run via `archarden-container-scan.timer` (Sun 04:20 local) and send `podman auto-update --dry-run` results plus a short `podman ps` listing when updates/errors occur.
 
 ## Swap and zram checks
 
