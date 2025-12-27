@@ -210,6 +210,7 @@ EOT
     write_file_atomic "${dest_dir}/nginx-proxy-manager.container" < "${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
     write_file_atomic "${dest_dir}/podman-run-npm.sh" < "${TEMPLATES_DIR}/containers/podman-run-npm.sh"
     write_file_atomic "${dest_dir}/gotify.container" < "${TEMPLATES_DIR}/containers/gotify.container"
+    write_file_atomic "${dest_dir}/uptime-kuma.container" < "${TEMPLATES_DIR}/containers/uptime-kuma.container"
     write_file_atomic "${dest_dir}/podman-run-gotify.sh" < "${TEMPLATES_DIR}/containers/podman-run-gotify.sh"
     run_cmd "chmod +x ${dest_dir}/podman-run-npm.sh"
     run_cmd "chmod +x ${dest_dir}/podman-run-gotify.sh"
@@ -276,6 +277,27 @@ configure_podman_runtime() {
     fi
     ensure_containers_runtime_config /etc/containers/containers.conf root root
     ensure_containers_runtime_config "${podmin_home}/.config/containers/containers.conf" "${PODMAN_USER}" "${PODMAN_USER}"
+}
+
+ensure_quadlet_generator() {
+    local generator_dir generator_path
+    generator_dir=$(systemd-path user-generators 2>/dev/null || true)
+    if [[ -z "${generator_dir}" ]]; then
+        generator_dir="/usr/lib/systemd/user-generators"
+    fi
+    generator_path="${generator_dir%/}/podman-system-generator"
+
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would check for podman quadlet generator at ${generator_path}"
+        return 0
+    fi
+
+    if [[ ! -x "${generator_path}" ]]; then
+        log_warn "Podman quadlet generator not found at ${generator_path}; rootless quadlet services cannot start"
+        log_warn "Install podman with quadlet support (podman-quadlet or podman package including quadlet) and rerun the hardener"
+        return 1
+    fi
+    return 0
 }
 
 ensure_npm_quadlet() {
@@ -544,6 +566,125 @@ ensure_gotify_quadlet() {
     run_cmd "chmod 0644 ${target}"
 }
 
+ensure_uptime_kuma_quadlet() {
+    local user_home systemd_dir target input tmp_out
+    user_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
+    if [[ -z "${user_home}" ]]; then
+        log_error "Unable to determine home for ${PODMAN_USER}"
+        exit 1
+    fi
+    systemd_dir="${user_home}/.config/containers/systemd"
+    target="${systemd_dir}/uptime-kuma.container"
+    input="${target}"
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${user_home}/.config ${user_home}/.config/containers ${systemd_dir}"
+    if [[ ! -f "${input}" ]]; then
+        input="${TEMPLATES_DIR}/containers/uptime-kuma.container"
+    fi
+
+    tmp_out=$(mktemp)
+    local in_container=0 saw_publish=0 saw_volume=0 saw_autoupdate=0 saw_image=0
+    local in_install=0 saw_install=0 saw_install_default_target=0
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^\[.*\] ]]; then
+            if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
+                echo "WantedBy=default.target" >>"${tmp_out}"
+                saw_install_default_target=1
+            fi
+            if [[ ${in_container} -eq 1 ]]; then
+                if [[ ${saw_image} -eq 0 ]]; then
+                    echo "Image=docker.io/louislam/uptime-kuma:2" >>"${tmp_out}"
+                fi
+                if [[ ${saw_publish} -eq 0 ]]; then
+                    echo "PublishPort=3001:3001" >>"${tmp_out}"
+                fi
+                if [[ ${saw_volume} -eq 0 ]]; then
+                    echo "Volume=/home/${PODMAN_USER}/.local/share/uptime-kuma:/app/data:Z" >>"${tmp_out}"
+                fi
+                if [[ ${saw_autoupdate} -eq 0 ]]; then
+                    echo "AutoUpdate=registry" >>"${tmp_out}"
+                fi
+            fi
+            in_container=0
+            in_install=0
+        fi
+
+        if [[ "${line}" =~ ^\[Install\]$ ]]; then
+            in_install=1
+            saw_install=1
+        fi
+
+        if [[ ${in_container} -eq 1 ]]; then
+            if [[ "${line}" =~ ^Image= ]]; then
+                line="Image=docker.io/louislam/uptime-kuma:2"
+                saw_image=1
+            fi
+            if [[ "${line}" =~ ^PublishPort= ]]; then
+                line="PublishPort=3001:3001"
+                saw_publish=1
+            fi
+            if [[ "${line}" =~ ^Volume= ]]; then
+                line="Volume=/home/${PODMAN_USER}/.local/share/uptime-kuma:/app/data:Z"
+                saw_volume=1
+            fi
+            if [[ "${line}" =~ ^AutoUpdate= ]]; then
+                line="AutoUpdate=registry"
+                saw_autoupdate=1
+            fi
+        fi
+
+        if [[ ${in_install} -eq 1 && "${line}" =~ ^WantedBy= ]]; then
+            if [[ "${line#WantedBy=}" == *"default.target"* ]]; then
+                saw_install_default_target=1
+            fi
+        fi
+
+        echo "${line}" >>"${tmp_out}"
+
+        if [[ "${line}" == "[Container]" ]]; then
+            in_container=1
+            saw_publish=0
+            saw_volume=0
+            saw_autoupdate=0
+            saw_image=0
+        fi
+    done < "${input}"
+
+    if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
+        echo "WantedBy=default.target" >>"${tmp_out}"
+        saw_install_default_target=1
+    fi
+
+    if [[ ${in_container} -eq 1 ]]; then
+        if [[ ${saw_image} -eq 0 ]]; then
+            echo "Image=docker.io/louislam/uptime-kuma:2" >>"${tmp_out}"
+        fi
+        if [[ ${saw_publish} -eq 0 ]]; then
+            echo "PublishPort=3001:3001" >>"${tmp_out}"
+        fi
+        if [[ ${saw_volume} -eq 0 ]]; then
+            echo "Volume=/home/${PODMAN_USER}/.local/share/uptime-kuma:/app/data:Z" >>"${tmp_out}"
+        fi
+        if [[ ${saw_autoupdate} -eq 0 ]]; then
+            echo "AutoUpdate=registry" >>"${tmp_out}"
+        fi
+    fi
+
+    if [[ ${saw_install} -eq 0 ]]; then
+        echo >>"${tmp_out}"
+        echo "[Install]" >>"${tmp_out}"
+        echo "WantedBy=default.target" >>"${tmp_out}"
+    elif [[ ${saw_install_default_target} -eq 0 ]]; then
+        echo "WantedBy=default.target" >>"${tmp_out}"
+        saw_install_default_target=1
+    fi
+
+    write_file_atomic "${target}" < "${tmp_out}"
+    rm -f "${tmp_out}"
+    run_cmd "chown ${PODMAN_USER}:${PODMAN_USER} ${target}"
+    run_cmd "chmod 0644 ${target}"
+}
+
 verify_quadlet_status() {
     local service="$1"
     ensure_podmin_user_manager
@@ -558,6 +699,10 @@ verify_quadlet_status() {
 configure_rootless_quadlets() {
     ensure_npm_quadlet
     ensure_gotify_quadlet
+    ensure_uptime_kuma_quadlet
+    if ! ensure_quadlet_generator; then
+        return
+    fi
     ensure_podmin_user_manager
     if ! podmin_systemctl daemon-reload; then
         log_warn "Failed to reload user systemd daemon for ${PODMAN_USER}; rootless services may not be active"
@@ -571,6 +716,11 @@ configure_rootless_quadlets() {
         log_warn "Failed to start gotify.service for ${PODMAN_USER}; rootless services may not be active"
     else
         verify_quadlet_status gotify.service
+    fi
+    if ! podmin_systemctl start uptime-kuma.service; then
+        log_warn "Failed to start uptime-kuma.service for ${PODMAN_USER}; rootless services may not be active"
+    else
+        verify_quadlet_status uptime-kuma.service
     fi
 }
 
@@ -625,6 +775,220 @@ EOT
     run_cmd "systemctl enable --now archarden-http.socket archarden-https.socket"
 }
 
+configure_gotify_notifications() {
+    local env_file=/etc/archarden/notify-gotify.env
+    local lib_dir=/usr/local/lib/archarden
+    local os_report_service=/etc/systemd/system/archarden-os-report.service
+    local os_report_timer=/etc/systemd/system/archarden-os-report.timer
+    local container_scan_service=/etc/systemd/system/archarden-container-scan.service
+    local container_scan_timer=/etc/systemd/system/archarden-container-scan.timer
+
+    run_cmd "install -d -m 0700 /etc/archarden"
+    run_cmd "install -d -m 0750 ${lib_dir}"
+
+    if [[ ! -f "${env_file}" ]]; then
+        write_file_atomic "${env_file}" <<'EOT'
+# Gotify endpoint and access token (leave blank to disable notifications)
+GOTIFY_URL=
+GOTIFY_TOKEN=
+# Optional priority (default 5)
+GOTIFY_PRIORITY=5
+EOT
+    fi
+    run_cmd "chmod 0600 ${env_file}"
+    run_cmd "chown root:root ${env_file}"
+
+    write_file_atomic "${lib_dir}/gotify_send.sh" <<'EOT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+env_file="/etc/archarden/notify-gotify.env"
+if [[ -f "${env_file}" ]]; then
+  # shellcheck disable=SC1090
+  source "${env_file}"
+fi
+
+if [[ -z "${GOTIFY_URL:-}" || -z "${GOTIFY_TOKEN:-}" ]]; then
+  echo "Gotify not configured; skipping notification" >&2
+  exit 0
+fi
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: ${0} <title> <message>" >&2
+  exit 1
+fi
+
+title="$1"
+message="$2"
+priority="${GOTIFY_PRIORITY:-5}"
+
+if [[ ${#message} -gt 3500 ]]; then
+  message="${message:0:3500}"
+fi
+
+if ! curl -fsS -X POST "${GOTIFY_URL%/}/message?token=${GOTIFY_TOKEN}" \
+  -F "title=${title}" \
+  -F "message=${message}" \
+  -F "priority=${priority}" >/dev/null; then
+  echo "Failed to send Gotify notification" >&2
+fi
+EOT
+    run_cmd "chmod 0750 ${lib_dir}/gotify_send.sh"
+    run_cmd "chown root:root ${lib_dir}/gotify_send.sh"
+
+    write_file_atomic "${lib_dir}/os_update_report.sh" <<'EOT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+notify_bin="/usr/local/lib/archarden/gotify_send.sh"
+updates_output=""
+audit_output=""
+
+if command -v checkupdates >/dev/null 2>&1; then
+  updates_output=$(checkupdates 2>/dev/null || true)
+else
+  echo "checkupdates not available; skipping pacman update check" >&2
+fi
+
+if command -v arch-audit >/dev/null 2>&1; then
+  audit_output=$(arch-audit 2>/dev/null || true)
+else
+  echo "arch-audit not available; skipping advisory check" >&2
+fi
+
+if [[ -z "${updates_output}" && -z "${audit_output}" ]]; then
+  exit 0
+fi
+
+message="PACMAN UPDATES"
+if [[ -n "${updates_output}" ]]; then
+  message+="
+${updates_output}"
+else
+  message+="
+None"
+fi
+
+message+="
+
+ARCH-AUDIT"
+if [[ -n "${audit_output}" ]]; then
+  message+="
+${audit_output}"
+else
+  message+="
+None"
+fi
+
+"${notify_bin}" "Arch updates and advisories" "${message}"
+EOT
+    run_cmd "chmod 0750 ${lib_dir}/os_update_report.sh"
+    run_cmd "chown root:root ${lib_dir}/os_update_report.sh"
+
+    write_file_atomic "${lib_dir}/container_update_scan.sh" <<'EOT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+notify_bin="/usr/local/lib/archarden/gotify_send.sh"
+auto_update_output=""
+ps_output=""
+updates_rc=0
+
+if command -v podman >/dev/null 2>&1; then
+  auto_update_output=$(runuser -u podmin -- podman auto-update --dry-run 2>&1) || updates_rc=$?
+  ps_output=$(runuser -u podmin -- podman ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>&1 || true)
+else
+  updates_rc=1
+  auto_update_output="podman not available"
+fi
+
+trimmed_updates=$(echo "${auto_update_output}" | sed '/^[[:space:]]*$/d')
+
+if [[ ${updates_rc} -ne 0 ]]; then
+  message="Podman auto-update --dry-run failed:
+${auto_update_output}"
+  if [[ -n "${ps_output}" ]]; then
+    message+="
+
+Running containers:
+${ps_output}"
+  fi
+  "${notify_bin}" "Container update scan error" "${message}"
+  exit 0
+fi
+
+if [[ -z "${trimmed_updates}" ]] || [[ "${trimmed_updates,,}" =~ no[[:space:]]+.*update ]]; then
+  exit 0
+fi
+
+message="Podman auto-update --dry-run reported updates:
+${trimmed_updates}"
+
+if [[ -n "${ps_output}" ]]; then
+  message+="
+
+Running containers:
+${ps_output}"
+fi
+
+"${notify_bin}" "Container updates available" "${message}"
+EOT
+    run_cmd "chmod 0750 ${lib_dir}/container_update_scan.sh"
+    run_cmd "chown root:root ${lib_dir}/container_update_scan.sh"
+
+    write_file_atomic "${os_report_service}" <<'EOT'
+[Unit]
+Description=Archarden daily OS update and advisory report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/archarden/os_update_report.sh
+EOT
+
+    write_file_atomic "${os_report_timer}" <<'EOT'
+[Unit]
+Description=Run archarden OS update report daily
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOT
+
+    write_file_atomic "${container_scan_service}" <<'EOT'
+[Unit]
+Description=Archarden weekly container update scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/archarden/container_update_scan.sh
+EOT
+
+    write_file_atomic "${container_scan_timer}" <<'EOT'
+[Unit]
+Description=Run archarden container update scan weekly
+
+[Timer]
+OnCalendar=Sun 04:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOT
+
+    run_cmd "chmod 0644 ${os_report_service} ${os_report_timer} ${container_scan_service} ${container_scan_timer}"
+    run_cmd "chown root:root ${os_report_service} ${os_report_timer} ${container_scan_service} ${container_scan_timer}"
+    run_cmd "systemctl daemon-reload"
+    run_cmd "systemctl enable --now archarden-os-report.timer"
+    run_cmd "systemctl enable --now archarden-container-scan.timer"
+}
+
 configure_sshd() {
     mkdir -p "${SSHD_CONFIG_DIR}"
     run_cmd "ssh-keygen -A"
@@ -673,6 +1037,216 @@ configure_zram() {
     if ! run_cmd "systemctl restart systemd-zram-setup@zram0.service"; then
         log_warn "systemd-zram-setup@zram0.service not available; ensure zram-generator is installed and units exist."
     fi
+}
+
+discover_public_ipv4() {
+    local ip
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i=="src") print $(i+1)}' | head -n1)
+    if [[ -z "${ip}" ]]; then
+        ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {sub("/.*","",$2); print $2}' | head -n1)
+    fi
+    echo "${ip}"
+}
+
+ensure_wireguard_keypair() {
+    local name="$1" key_path="$2" pub_path="$3"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would ensure WireGuard keypair for ${name} at ${key_path}"
+        return
+    fi
+    run_cmd "install -d -m 0700 /etc/wireguard/keys"
+    if [[ ! -f "${key_path}" ]]; then
+        run_cmd "umask 077 && wg genkey > ${key_path}"
+    fi
+    if [[ ! -f "${pub_path}" ]]; then
+        run_cmd "umask 077 && wg pubkey < ${key_path} > ${pub_path}"
+    fi
+    run_cmd "chmod 0600 ${key_path} ${pub_path}"
+}
+
+read_wireguard_key() {
+    local path="$1" fallback="$2"
+    if [[ -f "${path}" ]]; then
+        tr -d '\n' < "${path}"
+    else
+        echo "${fallback}"
+    fi
+}
+
+append_wireguard_peer() {
+    local tmp_file="$1" name="$2" pub_key="$3" allowed_ip="$4"
+    if grep -q "PublicKey = ${pub_key}" "${tmp_file}"; then
+        return
+    fi
+    {
+        echo
+        echo "[Peer]"
+        echo "# ${name}"
+        echo "PublicKey = ${pub_key}"
+        echo "AllowedIPs = ${allowed_ip}"
+        echo "PersistentKeepalive = 25"
+    } >> "${tmp_file}"
+}
+
+ensure_wireguard_config() {
+    local server_priv server_pub laptop_pub phone_pub tmp wg_conf=/etc/wireguard/wg0.conf
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        server_priv="DRY_RUN_SERVER_KEY"
+        server_pub="DRY_RUN_SERVER_PUB"
+        laptop_pub="DRY_RUN_LAPTOP_PUB"
+        phone_pub="DRY_RUN_PHONE_PUB"
+    else
+        ensure_wireguard_keypair "server" /etc/wireguard/keys/server.key /etc/wireguard/keys/server.pub
+        ensure_wireguard_keypair "laptop" /etc/wireguard/keys/laptop.key /etc/wireguard/keys/laptop.pub
+        ensure_wireguard_keypair "phone" /etc/wireguard/keys/phone.key /etc/wireguard/keys/phone.pub
+        server_priv=$(read_wireguard_key /etc/wireguard/keys/server.key "")
+        server_pub=$(read_wireguard_key /etc/wireguard/keys/server.pub "")
+        laptop_pub=$(read_wireguard_key /etc/wireguard/keys/laptop.pub "")
+        phone_pub=$(read_wireguard_key /etc/wireguard/keys/phone.pub "")
+        run_cmd "install -d -m 0700 /root/wireguard/clients"
+    fi
+
+    tmp=$(mktemp)
+    if [[ ! -f "${wg_conf}" ]]; then
+        cat <<EOT > "${tmp}"
+[Interface]
+Address = 10.66.66.1/24
+ListenPort = 51820
+PrivateKey = ${server_priv}
+
+[Peer]
+# laptop
+PublicKey = ${laptop_pub}
+AllowedIPs = 10.66.66.2/32
+PersistentKeepalive = 25
+
+[Peer]
+# phone
+PublicKey = ${phone_pub}
+AllowedIPs = 10.66.66.3/32
+PersistentKeepalive = 25
+EOT
+    else
+        local in_interface=0 saw_address=0 saw_listen=0 saw_private=0
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            if [[ "${line}" =~ ^\[.*\] ]]; then
+                if [[ ${in_interface} -eq 1 ]]; then
+                    if [[ ${saw_address} -eq 0 ]]; then
+                        echo "Address = 10.66.66.1/24" >> "${tmp}"
+                    fi
+                    if [[ ${saw_listen} -eq 0 ]]; then
+                        echo "ListenPort = 51820" >> "${tmp}"
+                    fi
+                    if [[ ${saw_private} -eq 0 ]]; then
+                        echo "PrivateKey = ${server_priv}" >> "${tmp}"
+                    fi
+                fi
+                in_interface=0
+            fi
+
+            if [[ "${line}" == "[Interface]" ]]; then
+                in_interface=1
+                saw_address=0
+                saw_listen=0
+                saw_private=0
+            elif [[ ${in_interface} -eq 1 ]]; then
+                if [[ "${line}" =~ ^Address[[:space:]]*= ]]; then
+                    line="Address = 10.66.66.1/24"
+                    saw_address=1
+                elif [[ "${line}" =~ ^ListenPort[[:space:]]*= ]]; then
+                    line="ListenPort = 51820"
+                    saw_listen=1
+                elif [[ "${line}" =~ ^PrivateKey[[:space:]]*= ]]; then
+                    line="PrivateKey = ${server_priv}"
+                    saw_private=1
+                fi
+            fi
+
+            echo "${line}" >> "${tmp}"
+        done < "${wg_conf}"
+
+        if [[ ${in_interface} -eq 1 ]]; then
+            if [[ ${saw_address} -eq 0 ]]; then
+                echo "Address = 10.66.66.1/24" >> "${tmp}"
+            fi
+            if [[ ${saw_listen} -eq 0 ]]; then
+                echo "ListenPort = 51820" >> "${tmp}"
+            fi
+            if [[ ${saw_private} -eq 0 ]]; then
+                echo "PrivateKey = ${server_priv}" >> "${tmp}"
+            fi
+        fi
+    fi
+
+    append_wireguard_peer "${tmp}" "laptop" "${laptop_pub}" "10.66.66.2/32"
+    append_wireguard_peer "${tmp}" "phone" "${phone_pub}" "10.66.66.3/32"
+
+    write_file_atomic "${wg_conf}" < "${tmp}"
+    rm -f "${tmp}"
+    if [[ ${DRY_RUN} -eq 0 ]]; then
+        run_cmd "chmod 0600 ${wg_conf}"
+        run_cmd "chown root:root ${wg_conf}"
+    fi
+}
+
+ensure_wireguard_client_config() {
+    local name="$1" ip_addr="$2" server_pub="$3" endpoint="$4" key_path="/etc/wireguard/keys/${name}.key" pub_path="/etc/wireguard/keys/${name}.pub" client_conf="/root/wireguard/clients/${name}.conf"
+    local priv_key pub_key tmp
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        priv_key="DRY_RUN_${name^^}_KEY"
+        pub_key="DRY_RUN_${name^^}_PUB"
+    else
+        ensure_wireguard_keypair "${name}" "${key_path}" "${pub_path}"
+        priv_key=$(read_wireguard_key "${key_path}" "")
+        pub_key=$(read_wireguard_key "${pub_path}" "")
+    fi
+
+    tmp=$(mktemp)
+    cat <<EOT > "${tmp}"
+[Interface]
+Address = ${ip_addr}
+PrivateKey = ${priv_key}
+DNS = 10.66.66.1
+
+[Peer]
+PublicKey = ${server_pub}
+Endpoint = ${endpoint}
+AllowedIPs = 10.66.66.1/32
+PersistentKeepalive = 25
+EOT
+
+    write_file_atomic "${client_conf}" < "${tmp}"
+    rm -f "${tmp}"
+    if [[ ${DRY_RUN} -eq 0 ]]; then
+        run_cmd "chmod 0600 ${client_conf}"
+        run_cmd "chown root:root ${client_conf}"
+    fi
+}
+
+configure_wireguard() {
+    local server_pub endpoint_ip endpoint_host="YOUR_SERVER_IP" endpoint
+
+    ensure_wireguard_config
+    server_pub=$(read_wireguard_key /etc/wireguard/keys/server.pub "DRY_RUN_SERVER_PUB")
+    endpoint_ip=$(discover_public_ipv4)
+    if [[ -n "${endpoint_ip}" ]]; then
+        endpoint_host="${endpoint_ip}"
+    else
+        log_warn "Could not detect public IPv4 address; using placeholder in WireGuard client configs"
+    fi
+    endpoint="${endpoint_host}:51820"
+
+    ensure_wireguard_client_config "laptop" "10.66.66.2/32" "${server_pub}" "${endpoint}"
+    ensure_wireguard_client_config "phone" "10.66.66.3/32" "${server_pub}" "${endpoint}"
+
+    if [[ ${DRY_RUN} -eq 0 ]]; then
+        run_cmd "systemctl enable --now wg-quick@wg0.service"
+    else
+        log_info "[DRY-RUN] Would enable and start wg-quick@wg0.service"
+    fi
+    run_status_capture "wg show wg0" wg show wg0
+    run_status_capture "systemctl is-active wg-quick@wg0" systemctl is-active wg-quick@wg0.service
+    log_info "WireGuard client configs available under /root/wireguard/clients"
 }
 
 configure_ufw() {
@@ -724,6 +1298,10 @@ configure_ufw() {
             run_cmd "ufw allow ${port}"
         done
     fi
+
+    run_cmd "ufw allow 51820/udp comment 'WireGuard'"
+    run_cmd "ufw allow in on wg0 to any port 81 proto tcp comment 'NPM Admin (VPN)'"
+    run_cmd "ufw allow in on wg0 to any port 3001 proto tcp comment 'Uptime Kuma (VPN)'"
 
     if [[ ${SKIP_FIREWALL_ENABLE} -eq 1 ]]; then
         log_warn "Skipping firewall enable as requested"
@@ -1121,6 +1699,7 @@ $( (( ENABLE_FAIL2BAN )) && echo "🛡️ Fail2ban: enabled" || echo "🛡️ Fa
 🐧 Kernel: $(uname -r)
 📦 Packages updated and installed.
 🧰 Templates installed to /usr/share/vps-harden/templates/containers
+🔑 WireGuard client configs: /root/wireguard/clients/*.conf
 📜 Log: ${LOG_FILE}
 EOF
     )
@@ -1765,11 +2344,13 @@ show_version() {
     configure_sshd
     restart_sshd_and_verify
     rotate_sshd_host_keys
+    configure_wireguard
     configure_ufw
     configure_fail2ban
     configure_podman_templates
     configure_rootless_quadlets
     configure_socket_proxyd
+    configure_gotify_notifications
     verify_podman_runtime
     verify_zram_swap
     ensure_default_target
