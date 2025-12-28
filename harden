@@ -2511,6 +2511,21 @@ status_report() {
     fi
 }
 
+final_container_checks() {
+    log_info "==== FINAL CONTAINER AND PORT CHECK ===="
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would verify podmin containers and admin ports"
+        return
+    fi
+    if command -v runuser >/dev/null 2>&1 && command -v podman >/dev/null 2>&1; then
+        run_status_capture "podman ps (as ${PODMAN_USER})" runuser -u "${PODMAN_USER}" -- podman ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
+    else
+        log_warn "podman or runuser not available; skipping podman ps check"
+    fi
+    run_status_capture "podmin services" bash -c "systemctl --user --machine=${PODMAN_USER}@.host list-units --type=service --state=running | grep -E 'nginx-proxy-manager|gotify|uptime-kuma' || true"
+    run_status_capture "admin ports listening" bash -c "ss -lntup | grep -E ':(81|3001|${GOTIFY_PORT})\\b' || true"
+}
+
 usage() {
     printf "%s\n" "$(bold "Usage:") $(cyan "sudo ./harden [options]")"
     printf "\n%s\n" "$(bold "$(green "Required")")"
@@ -2645,6 +2660,7 @@ show_version() {
     ensure_default_target
     disable_units_from_config
     status_report
+    final_container_checks
     final_summary
     write_user_readme
     archive_backups
