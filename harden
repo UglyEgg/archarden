@@ -1224,7 +1224,7 @@ ensure_wireguard_config() {
         for name in "${WIREGUARD_PEER_NAMES[@]}"; do
             ensure_wireguard_keypair "${name}" "/etc/wireguard/keys/${name}.key" "/etc/wireguard/keys/${name}.pub"
             peer_pub_keys[idx]=$(read_wireguard_key "/etc/wireguard/keys/${name}.pub" "")
-            ((idx++))
+            ((idx += 1))
         done
         run_cmd "install -d -m 0700 /root/wireguard/clients"
     fi
