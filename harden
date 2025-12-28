@@ -62,6 +62,16 @@ PERSISTED_PUBKEY_FILE="${STATE_DIR}/pubkey"
 CONTINUE_SERVICE="/etc/systemd/system/vps-harden-continue.service"
 CONTINUE_SERVICE_TEMPLATE="${TEMPLATES_DIR}/systemd/vps-harden-continue.service"
 FINAL_LOG_FILE=""
+WG_INTERFACE_ADDRESS=""
+WG_LISTEN_PORT=""
+WG_DNS=""
+WG_PEERS=()
+WIREGUARD_CONFIG_LOADED=0
+WIREGUARD_PEER_NAMES=()
+WIREGUARD_PEER_IPS=()
+WIREGUARD_SERVER_IP=""
+WIREGUARD_SERVER_ALLOWED_IP=""
+PODMAN_API_GROUP="podman-api"
 
 clear_pending_state() {
     if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -775,6 +785,69 @@ EOT
     run_cmd "systemctl enable --now archarden-http.socket archarden-https.socket"
 }
 
+ensure_podmin_podman_socket() {
+    ensure_podmin_user_manager
+    podmin_systemctl enable --now podman.socket
+}
+
+ensure_podman_api_group() {
+    if getent group "${PODMAN_API_GROUP}" >/dev/null 2>&1; then
+        :
+    else
+        run_cmd "groupadd -r ${PODMAN_API_GROUP}"
+        log_info "Created system group ${PODMAN_API_GROUP} for Podman API access"
+    fi
+    if [[ -n "${USER_NAME}" ]]; then
+        ensure_user_in_group "${USER_NAME}" "${PODMAN_API_GROUP}"
+    fi
+}
+
+configure_podman_api_proxy() {
+    ensure_podmin_podman_socket
+    ensure_podman_api_group
+
+    local proxy_socket=/etc/systemd/system/podmin-podman.socket
+    local proxy_service=/etc/systemd/system/podmin-podman.service
+    local podman_socket="unix:/run/user/${PODMAN_UID}/podman/podman.sock"
+
+    backup_file "${proxy_socket}"
+    backup_file "${proxy_service}"
+
+    write_file_atomic "${proxy_socket}" <<EOT
+[Unit]
+Description=Proxy socket to ${PODMAN_USER} Podman API
+
+[Socket]
+ListenStream=/run/podmin-podman.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=${PODMAN_API_GROUP}
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
+EOT
+
+    write_file_atomic "${proxy_service}" <<EOT
+[Unit]
+Description=Proxy to ${PODMAN_USER} Podman API
+Requires=podmin-podman.socket
+After=podmin-podman.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd ${podman_socket}
+User=root
+Group=root
+StandardInput=socket
+
+[Install]
+WantedBy=multi-user.target
+EOT
+
+    run_cmd "systemctl daemon-reload"
+    run_cmd "systemctl enable --now podmin-podman.socket"
+}
+
 configure_gotify_notifications() {
     local env_file=/etc/archarden/notify-gotify.env
     local lib_dir=/usr/local/lib/archarden
@@ -1048,6 +1121,51 @@ discover_public_ipv4() {
     echo "${ip}"
 }
 
+load_wireguard_config() {
+    local cfg="${CONFIG_DIR}/wireguard.conf" entry name ip
+    if [[ ! -f "${cfg}" ]]; then
+        log_error "WireGuard config file not found at ${cfg}"
+        exit 1
+    fi
+
+    WG_PEERS=()
+    # shellcheck disable=SC1090
+    source "${cfg}"
+
+    if [[ -z "${WG_INTERFACE_ADDRESS:-}" || -z "${WG_LISTEN_PORT:-}" || -z "${WG_DNS:-}" ]]; then
+        log_error "WG_INTERFACE_ADDRESS, WG_LISTEN_PORT, and WG_DNS must be set in ${cfg}"
+        exit 1
+    fi
+
+    WIREGUARD_SERVER_IP="${WG_INTERFACE_ADDRESS%%/*}"
+    WIREGUARD_SERVER_ALLOWED_IP="${WIREGUARD_SERVER_IP}/32"
+    WIREGUARD_PEER_NAMES=()
+    WIREGUARD_PEER_IPS=()
+
+    if [[ ${#WG_PEERS[@]} -eq 0 ]]; then
+        log_error "WG_PEERS must include at least one entry in ${cfg} (format: name:address)"
+        exit 1
+    fi
+
+    for entry in "${WG_PEERS[@]}"; do
+        IFS=":" read -r name ip <<<"${entry}"
+        if [[ -z "${name}" || -z "${ip}" ]]; then
+            log_error "Invalid WireGuard peer entry '${entry}' in ${cfg}; expected name:address"
+            exit 1
+        fi
+        WIREGUARD_PEER_NAMES+=("${name}")
+        WIREGUARD_PEER_IPS+=("${ip}")
+    done
+
+    WIREGUARD_CONFIG_LOADED=1
+}
+
+ensure_wireguard_config_loaded() {
+    if [[ ${WIREGUARD_CONFIG_LOADED} -eq 0 ]]; then
+        load_wireguard_config
+    fi
+}
+
 ensure_wireguard_keypair() {
     local name="$1" key_path="$2" pub_path="$3"
     if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -1089,20 +1207,25 @@ append_wireguard_peer() {
 }
 
 ensure_wireguard_config() {
-    local server_priv server_pub laptop_pub phone_pub tmp wg_conf=/etc/wireguard/wg0.conf
+    ensure_wireguard_config_loaded
+    local server_priv server_pub tmp wg_conf=/etc/wireguard/wg0.conf
+    local -a peer_pub_keys=()
     if [[ ${DRY_RUN} -eq 1 ]]; then
         server_priv="DRY_RUN_SERVER_KEY"
         server_pub="DRY_RUN_SERVER_PUB"
-        laptop_pub="DRY_RUN_LAPTOP_PUB"
-        phone_pub="DRY_RUN_PHONE_PUB"
+        for name in "${WIREGUARD_PEER_NAMES[@]}"; do
+            peer_pub_keys+=("DRY_RUN_${name^^}_PUB")
+        done
     else
         ensure_wireguard_keypair "server" /etc/wireguard/keys/server.key /etc/wireguard/keys/server.pub
-        ensure_wireguard_keypair "laptop" /etc/wireguard/keys/laptop.key /etc/wireguard/keys/laptop.pub
-        ensure_wireguard_keypair "phone" /etc/wireguard/keys/phone.key /etc/wireguard/keys/phone.pub
         server_priv=$(read_wireguard_key /etc/wireguard/keys/server.key "")
         server_pub=$(read_wireguard_key /etc/wireguard/keys/server.pub "")
-        laptop_pub=$(read_wireguard_key /etc/wireguard/keys/laptop.pub "")
-        phone_pub=$(read_wireguard_key /etc/wireguard/keys/phone.pub "")
+        local idx=0
+        for name in "${WIREGUARD_PEER_NAMES[@]}"; do
+            ensure_wireguard_keypair "${name}" "/etc/wireguard/keys/${name}.key" "/etc/wireguard/keys/${name}.pub"
+            peer_pub_keys[idx]=$(read_wireguard_key "/etc/wireguard/keys/${name}.pub" "")
+            ((idx++))
+        done
         run_cmd "install -d -m 0700 /root/wireguard/clients"
     fi
 
@@ -1110,21 +1233,9 @@ ensure_wireguard_config() {
     if [[ ! -f "${wg_conf}" ]]; then
         cat <<EOT > "${tmp}"
 [Interface]
-Address = 10.66.66.1/24
-ListenPort = 51820
+Address = ${WG_INTERFACE_ADDRESS}
+ListenPort = ${WG_LISTEN_PORT}
 PrivateKey = ${server_priv}
-
-[Peer]
-# laptop
-PublicKey = ${laptop_pub}
-AllowedIPs = 10.66.66.2/32
-PersistentKeepalive = 25
-
-[Peer]
-# phone
-PublicKey = ${phone_pub}
-AllowedIPs = 10.66.66.3/32
-PersistentKeepalive = 25
 EOT
     else
         local in_interface=0 saw_address=0 saw_listen=0 saw_private=0
@@ -1132,10 +1243,10 @@ EOT
             if [[ "${line}" =~ ^\[.*\] ]]; then
                 if [[ ${in_interface} -eq 1 ]]; then
                     if [[ ${saw_address} -eq 0 ]]; then
-                        echo "Address = 10.66.66.1/24" >> "${tmp}"
+                        echo "Address = ${WG_INTERFACE_ADDRESS}" >> "${tmp}"
                     fi
                     if [[ ${saw_listen} -eq 0 ]]; then
-                        echo "ListenPort = 51820" >> "${tmp}"
+                        echo "ListenPort = ${WG_LISTEN_PORT}" >> "${tmp}"
                     fi
                     if [[ ${saw_private} -eq 0 ]]; then
                         echo "PrivateKey = ${server_priv}" >> "${tmp}"
@@ -1151,10 +1262,10 @@ EOT
                 saw_private=0
             elif [[ ${in_interface} -eq 1 ]]; then
                 if [[ "${line}" =~ ^Address[[:space:]]*= ]]; then
-                    line="Address = 10.66.66.1/24"
+                    line="Address = ${WG_INTERFACE_ADDRESS}"
                     saw_address=1
                 elif [[ "${line}" =~ ^ListenPort[[:space:]]*= ]]; then
-                    line="ListenPort = 51820"
+                    line="ListenPort = ${WG_LISTEN_PORT}"
                     saw_listen=1
                 elif [[ "${line}" =~ ^PrivateKey[[:space:]]*= ]]; then
                     line="PrivateKey = ${server_priv}"
@@ -1167,10 +1278,10 @@ EOT
 
         if [[ ${in_interface} -eq 1 ]]; then
             if [[ ${saw_address} -eq 0 ]]; then
-                echo "Address = 10.66.66.1/24" >> "${tmp}"
+                echo "Address = ${WG_INTERFACE_ADDRESS}" >> "${tmp}"
             fi
             if [[ ${saw_listen} -eq 0 ]]; then
-                echo "ListenPort = 51820" >> "${tmp}"
+                echo "ListenPort = ${WG_LISTEN_PORT}" >> "${tmp}"
             fi
             if [[ ${saw_private} -eq 0 ]]; then
                 echo "PrivateKey = ${server_priv}" >> "${tmp}"
@@ -1178,8 +1289,10 @@ EOT
         fi
     fi
 
-    append_wireguard_peer "${tmp}" "laptop" "${laptop_pub}" "10.66.66.2/32"
-    append_wireguard_peer "${tmp}" "phone" "${phone_pub}" "10.66.66.3/32"
+    local i
+    for i in "${!WIREGUARD_PEER_NAMES[@]}"; do
+        append_wireguard_peer "${tmp}" "${WIREGUARD_PEER_NAMES[i]}" "${peer_pub_keys[i]}" "${WIREGUARD_PEER_IPS[i]}"
+    done
 
     write_file_atomic "${wg_conf}" < "${tmp}"
     rm -f "${tmp}"
@@ -1190,7 +1303,13 @@ EOT
 }
 
 ensure_wireguard_client_config() {
-    local name="$1" ip_addr="$2" server_pub="$3" endpoint="$4" key_path="/etc/wireguard/keys/${name}.key" pub_path="/etc/wireguard/keys/${name}.pub" client_conf="/root/wireguard/clients/${name}.conf"
+    local name="${1-}" ip_addr="${2-}" server_pub="${3-}" endpoint="${4-}"
+    if [[ -z "${name}" || -z "${ip_addr}" || -z "${server_pub}" || -z "${endpoint}" ]]; then
+        log_error "ensure_wireguard_client_config requires name, ip_addr, server_pub, and endpoint"
+        exit 1
+    fi
+
+    local key_path="/etc/wireguard/keys/${name}.key" pub_path="/etc/wireguard/keys/${name}.pub" client_conf="/root/wireguard/clients/${name}.conf"
     local priv_key pub_key tmp
     if [[ ${DRY_RUN} -eq 1 ]]; then
         priv_key="DRY_RUN_${name^^}_KEY"
@@ -1206,12 +1325,12 @@ ensure_wireguard_client_config() {
 [Interface]
 Address = ${ip_addr}
 PrivateKey = ${priv_key}
-DNS = 10.66.66.1
+DNS = ${WG_DNS}
 
 [Peer]
 PublicKey = ${server_pub}
 Endpoint = ${endpoint}
-AllowedIPs = 10.66.66.1/32
+AllowedIPs = ${WIREGUARD_SERVER_ALLOWED_IP}
 PersistentKeepalive = 25
 EOT
 
@@ -1224,6 +1343,7 @@ EOT
 }
 
 configure_wireguard() {
+    ensure_wireguard_config_loaded
     local server_pub endpoint_ip endpoint_host="YOUR_SERVER_IP" endpoint
 
     ensure_wireguard_config
@@ -1234,10 +1354,12 @@ configure_wireguard() {
     else
         log_warn "Could not detect public IPv4 address; using placeholder in WireGuard client configs"
     fi
-    endpoint="${endpoint_host}:51820"
+    endpoint="${endpoint_host}:${WG_LISTEN_PORT}"
 
-    ensure_wireguard_client_config "laptop" "10.66.66.2/32" "${server_pub}" "${endpoint}"
-    ensure_wireguard_client_config "phone" "10.66.66.3/32" "${server_pub}" "${endpoint}"
+    local i
+    for i in "${!WIREGUARD_PEER_NAMES[@]}"; do
+        ensure_wireguard_client_config "${WIREGUARD_PEER_NAMES[i]}" "${WIREGUARD_PEER_IPS[i]}" "${server_pub}" "${endpoint}"
+    done
 
     if [[ ${DRY_RUN} -eq 0 ]]; then
         run_cmd "systemctl enable --now wg-quick@wg0.service"
@@ -1254,6 +1376,7 @@ configure_ufw() {
         log_warn "Firewall configuration disabled by flag"
         return
     fi
+    ensure_wireguard_config_loaded
     ensure_firewall_backend
 
     if ! command -v ufw >/dev/null 2>&1; then
@@ -1299,7 +1422,7 @@ configure_ufw() {
         done
     fi
 
-    run_cmd "ufw allow 51820/udp comment 'WireGuard'"
+    run_cmd "ufw allow ${WG_LISTEN_PORT}/udp comment 'WireGuard'"
     run_cmd "ufw allow in on wg0 to any port 81 proto tcp comment 'NPM Admin (VPN)'"
     run_cmd "ufw allow in on wg0 to any port 3001 proto tcp comment 'Uptime Kuma (VPN)'"
 
@@ -1309,6 +1432,11 @@ configure_ufw() {
     fi
 
     run_cmd "ufw --force enable"
+    if command -v systemctl >/dev/null 2>&1; then
+        run_cmd "systemctl enable --now ufw"
+    else
+        log_warn "systemctl not found; ensure ufw starts on boot"
+    fi
     if [[ ${KEEP_SSH_22} -eq 0 ]]; then
         if [ "${DRY_RUN}" -eq 0 ]; then
             ufw delete allow 22/tcp >/dev/null 2>&1 || true
@@ -2349,6 +2477,7 @@ show_version() {
     configure_fail2ban
     configure_podman_templates
     configure_rootless_quadlets
+    configure_podman_api_proxy
     configure_socket_proxyd
     configure_gotify_notifications
     verify_podman_runtime
