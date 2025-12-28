@@ -10,7 +10,8 @@ CURRENT_PHASE="phase0"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 SSHD_HARDENING_DROPIN="${SSHD_CONFIG_DIR}/10-hardening.conf"
 SSHD_CRYPTO_DROPIN="${SSHD_CONFIG_DIR}/10-crypto-hardening.conf"
-SSH_HOSTKEY_BACKUP_BASE="/root/ssh-hostkey-backup"
+BACKUP_ROOT_BASE="/root/archarden-backups"
+SSH_HOSTKEY_BACKUP_CATEGORY="ssh-hostkeys"
 for arg in "$@"; do
     if [[ "${arg}" == "--resume" ]]; then
         LOG_FILE="${PHASE1_LOG}"
@@ -59,9 +60,15 @@ INSTALL_BIN="/usr/local/bin/vps-harden"
 STATE_DIR="/var/lib/vps-harden"
 PENDING_ARGS_FILE="${STATE_DIR}/pending_args"
 PERSISTED_PUBKEY_FILE="${STATE_DIR}/pubkey"
+RUN_ID_FILE="${STATE_DIR}/run_id"
 CONTINUE_SERVICE="/etc/systemd/system/vps-harden-continue.service"
 CONTINUE_SERVICE_TEMPLATE="${TEMPLATES_DIR}/systemd/vps-harden-continue.service"
 FINAL_LOG_FILE=""
+RUN_ID=""
+BACKUP_ROOT=""
+BACKUP_ARCHIVE=""
+README_MARKER="<!-- managed: archarden -->"
+GOTIFY_PORT=8090
 WG_INTERFACE_ADDRESS=""
 WG_LISTEN_PORT=""
 WG_DNS=""
@@ -79,6 +86,43 @@ clear_pending_state() {
         return
     fi
     rm -f "${PENDING_ARGS_FILE}"
+}
+
+ensure_backup_root() {
+    if [[ -z "${BACKUP_ROOT:-}" ]]; then
+        log_error "BACKUP_ROOT is not set; initialize run context before creating backups."
+        exit 1
+    fi
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would ensure backup root at ${BACKUP_ROOT}"
+        return
+    fi
+    run_cmd "install -d -m 0700 -o root -g root \"${BACKUP_ROOT_BASE}\""
+    run_cmd "install -d -m 0700 -o root -g root \"${BACKUP_ROOT}\""
+}
+
+initialize_run_context() {
+    local ts existing_run_id=""
+    if [[ -z "${RUN_ID:-}" && ${RESUME_MODE:-0} -eq 1 && -s "${RUN_ID_FILE}" ]]; then
+        existing_run_id=$(cat "${RUN_ID_FILE}")
+        RUN_ID="${existing_run_id}"
+        log_info "Resuming with existing run id ${RUN_ID}"
+    fi
+    if [[ -z "${RUN_ID:-}" ]]; then
+        ts=$(date -u '+%Y%m%d-%H%M%SZ')
+        RUN_ID="${ts}"
+        log_info "Generated run id ${RUN_ID} for this execution"
+    fi
+    BACKUP_ROOT="${BACKUP_ROOT_BASE}/${RUN_ID}"
+    BACKUP_ARCHIVE="/root/archarden-backups-${RUN_ID}.tar.gz"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would record run id at ${RUN_ID_FILE} and ensure backup root ${BACKUP_ROOT}"
+        return
+    fi
+    run_cmd "install -d -m 0700 -o root -g root \"${STATE_DIR}\""
+    run_cmd "install -m 0600 /dev/null \"${RUN_ID_FILE}\""
+    echo "${RUN_ID}" > "${RUN_ID_FILE}"
+    ensure_backup_root
 }
 
 ensure_fail2ban_sshd_local() {
@@ -1844,8 +1888,113 @@ EOF
     log_info "Summary written to ${FINAL_LOG_FILE}"
 }
 
+write_user_readme() {
+    local target_user="${USER_NAME}" target_home readme_path alt_readme marker dest vpn_ip gotify_port npm_port=81 kuma_port=3001 wg_client_dir="/root/wireguard/clients"
+    marker="${README_MARKER}"
+    gotify_port=${GOTIFY_PORT}
+    vpn_ip="${WIREGUARD_SERVER_IP:-${WG_INTERFACE_ADDRESS%%/*}}"
+    if [[ -z "${vpn_ip}" ]]; then
+        vpn_ip="10.66.66.1"
+    fi
+    if [[ -z "${target_user}" ]]; then
+        log_warn "No target user specified; skipping README generation"
+        return
+    fi
+    target_home=$(getent passwd "${target_user}" | cut -d: -f6)
+    if [[ -z "${target_home}" ]]; then
+        log_error "Unable to determine home directory for ${target_user}"
+        return
+    fi
+    readme_path="${target_home}/README.md"
+    alt_readme="${target_home}/README.archarden.md"
+    dest="${readme_path}"
+    if [[ -f "${readme_path}" ]] && ! grep -qF "${marker}" "${readme_path}"; then
+        dest="${alt_readme}"
+    elif [[ -f "${alt_readme}" ]] && grep -qF "${marker}" "${alt_readme}"; then
+        dest="${alt_readme}"
+    fi
+
+    local content
+    content=$(cat <<EOF
+${marker}
+# Archarden: next steps after reboot
+
+## 1. Establish WireGuard VPN connection
+- Server VPN IP: ${vpn_ip}
+- Client configs to retrieve:
+  - ${wg_client_dir}/laptop.conf
+  - ${wg_client_dir}/phone.conf
+- Copy a client config securely (replace <server> with your hostname or IP):
+  - scp -P ${SSH_PORT} root@<server>:${wg_client_dir}/laptop.conf .
+  - (or: sudo cat ${wg_client_dir}/laptop.conf > laptop.conf)
+- Bring the tunnel up on the client:
+  - Linux: wg-quick up ./laptop.conf
+  - Mobile: import the config into the WireGuard app
+- Verify on the server:
+  - sudo wg show wg0
+  - Expected: peer handshakes updating for connected clients.
+
+## 2. Bind admin ports to the VPN interface only
+- Policy: admin services stay off the public internet; they should only listen on wg0.
+- Apply/confirm UFW rules:
+  - sudo ufw allow in on wg0 to any port ${npm_port} proto tcp comment 'NPM Admin (VPN)'
+  - sudo ufw allow in on wg0 to any port ${kuma_port} proto tcp comment 'Uptime Kuma (VPN)'
+  - sudo ufw allow in on wg0 to any port ${gotify_port} proto tcp comment 'Gotify (VPN)'
+- Verify:
+  - sudo ufw status verbose
+  - ss -lntup | grep -E ':(81|3001|${gotify_port})\\b' || true
+  - (Optional) External scans should NOT show these ports.
+
+## 3. Connect to admin services (after VPN is up)
+- NPM Admin: http://${vpn_ip}:${npm_port}
+- Uptime Kuma: http://${vpn_ip}:${kuma_port}
+- Gotify: http://${vpn_ip}:${gotify_port}
+
+## 4. OPTIONAL (after verifying VPN works)
+- Restrict SSH to the VPN only (keep console/rescue for break-glass access):
+  - sudo ufw delete limit ${SSH_PORT}/tcp || sudo ufw delete allow ${SSH_PORT}/tcp
+  - sudo ufw allow in on wg0 to any port ${SSH_PORT} proto tcp comment 'SSH (VPN only)'
+- Restrict admin ports to wg0 if not already done:
+  - sudo ufw allow in on wg0 to any port ${npm_port} proto tcp comment 'NPM Admin (VPN)'
+  - sudo ufw allow in on wg0 to any port ${kuma_port} proto tcp comment 'Uptime Kuma (VPN)'
+  - sudo ufw allow in on wg0 to any port ${gotify_port} proto tcp comment 'Gotify (VPN)'
+- Post-VPN validation:
+  - Confirm no public-facing allow/limit rules remain for SSH or admin ports.
+  - Re-scan from outside the VPN to verify only expected services are exposed.
+EOF
+)
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would write ${dest} for ${target_user}"
+        echo "${content}" | sed 's/^/    /' >&2
+        return
+    fi
+    write_file_atomic "${dest}" <<< "${content}"
+    run_cmd "chown ${target_user}:${target_user} \"${dest}\""
+    run_cmd "chmod 0644 \"${dest}\""
+    log_info "User README written to ${dest}"
+}
+
+archive_backups() {
+    ensure_backup_root
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would archive backups from ${BACKUP_ROOT} to ${BACKUP_ARCHIVE}"
+        return
+    fi
+    if [[ ! -d "${BACKUP_ROOT}" ]]; then
+        run_cmd "install -d -m 0700 -o root -g root \"${BACKUP_ROOT}\""
+    fi
+    if [[ -f "${BACKUP_ARCHIVE}" ]]; then
+        run_cmd "rm -f \"${BACKUP_ARCHIVE}\""
+    fi
+    run_cmd "umask 077 && tar -C /root -czf \"${BACKUP_ARCHIVE}\" \"archarden-backups/${RUN_ID}\""
+    run_cmd "chown root:root \"${BACKUP_ARCHIVE}\""
+    run_cmd "chmod 0600 \"${BACKUP_ARCHIVE}\""
+    log_info "Backups archived at ${BACKUP_ARCHIVE}"
+    log_info "Backup directory retained at ${BACKUP_ROOT}"
+}
+
 trigger_final_reboot() {
-    log_warn "==== Phase 1 completed; system will reboot in 5 seconds to finalize services and quadlets ===="
+    log_info "==== Phase 1 completed; system will reboot in 5 seconds to finalize services and quadlets ===="
     if [[ ${DRY_RUN} -eq 1 ]]; then
         log_info "[DRY-RUN] Would reboot now to complete Phase 1"
         return
@@ -2209,11 +2358,18 @@ verify_zram_swap() {
 }
 
 restore_sshd_dropins() {
-    local restored=0 dropin latest_backup
+    local restored=0 dropin latest_backup backup_pattern
     for dropin in "${SSHD_HARDENING_DROPIN}" "${SSHD_CRYPTO_DROPIN}"; do
-        latest_backup=$(ls -1t "${dropin}".*.bak 2>/dev/null | head -n1 || true)
+        latest_backup=""
+        if [[ -n "${BACKUP_ROOT:-}" ]]; then
+            backup_pattern="${BACKUP_ROOT}/configs/${dropin#/}"
+            latest_backup=$(ls -1t "${backup_pattern}".*.bak 2>/dev/null | head -n1 || true)
+        fi
+        if [[ -z "${latest_backup}" ]]; then
+            latest_backup=$(ls -1t "${dropin}".*.bak 2>/dev/null | head -n1 || true)
+        fi
         if [[ -n "${latest_backup}" ]]; then
-            run_cmd "cp -p ${latest_backup} ${dropin}"
+            run_cmd "cp -p \"${latest_backup}\" \"${dropin}\""
             restored=1
         elif [[ -f "${dropin}" ]]; then
             run_cmd "rm -f ${dropin}"
@@ -2270,16 +2426,18 @@ restart_sshd_and_verify() {
 rotate_sshd_host_keys() {
     local ts backup_dir rotation_failed=0
     ts=$(date -u '+%Y%m%d%H%M%S')
-    backup_dir="${SSH_HOSTKEY_BACKUP_BASE}/${ts}"
+    ensure_backup_root
+    backup_dir="${BACKUP_ROOT}/${SSH_HOSTKEY_BACKUP_CATEGORY}/${ts}"
 
     if [[ ${DRY_RUN} -eq 1 ]]; then
         log_info "[DRY-RUN] Would backup host keys to ${backup_dir}, regenerate with ssh-keygen -A, and restart sshd"
         return
     fi
 
-    run_cmd "install -d -m 0700 ${backup_dir}"
+    run_cmd "install -d -m 0700 -o root -g root \"${backup_dir}\""
     if ls /etc/ssh/ssh_host_* >/dev/null 2>&1; then
-        run_cmd "cp -a /etc/ssh/ssh_host_* ${backup_dir}/"
+        run_cmd "cp -a /etc/ssh/ssh_host_* \"${backup_dir}/\""
+        BACKUP_PATHS+=("${backup_dir}")
         log_info "Backed up existing ssh host keys to ${backup_dir}"
     else
         log_warn "No existing ssh host keys found before rotation"
@@ -2320,7 +2478,7 @@ rotate_sshd_host_keys() {
     log_warn "Host key rotation failed; attempting to restore previous keys from ${backup_dir}"
     run_cmd "rm -f /etc/ssh/ssh_host_*"
     if ls "${backup_dir}"/ssh_host_* >/dev/null 2>&1; then
-        run_cmd "cp -a ${backup_dir}/ssh_host_* /etc/ssh/"
+        run_cmd "cp -a \"${backup_dir}\"/ssh_host_* /etc/ssh/"
     fi
     if sshd -t && run_cmd "systemctl restart sshd" && verify_sshd_port; then
         log_warn "Restored previous sshd host keys after rotation failure."
@@ -2451,6 +2609,7 @@ show_version() {
 
     parse_args "$@"
     preflight
+    initialize_run_context
     install_self
     clear_pending_state
     ensure_lts_kernel_and_reboot_gate "$@"
@@ -2486,6 +2645,8 @@ show_version() {
     disable_units_from_config
     status_report
     final_summary
+    write_user_readme
+    archive_backups
     trigger_final_reboot
 }
 

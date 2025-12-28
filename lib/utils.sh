@@ -60,12 +60,28 @@ run_cmd() {
 }
 
 backup_file() {
-    local file="$1"
+    local file="$1" category="${2:-configs}"
     if [ -f "${file}" ]; then
-        local ts
+        if [[ -z "${BACKUP_ROOT:-}" ]]; then
+            log_error "BACKUP_ROOT is not set; cannot back up ${file}"
+            exit 1
+        fi
+        local ts rel dest_dir backup backup_name
         ts=$(date -u '+%Y%m%d%H%M%S')
-        local backup="${file}.${ts}.bak"
-        run_cmd "cp -p ${file} ${backup}"
+        rel="${file#/}"
+        ensure_backup_root
+        dest_dir="${BACKUP_ROOT}/${category}"
+        if [[ "${rel}" == */* ]]; then
+            dest_dir="${dest_dir}/$(dirname "${rel}")"
+        fi
+        backup_name="$(basename "${file}").${ts}.bak"
+        backup="${dest_dir}/${backup_name}"
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            log_info "[DRY-RUN] Would back up ${file} to ${backup}"
+            return
+        fi
+        run_cmd "install -d -m 0700 -o root -g root \"${dest_dir}\""
+        run_cmd "cp -p \"${file}\" \"${backup}\""
         BACKUP_PATHS+=("${backup}")
         log_info "Backed up ${file} to ${backup}"
     fi
