@@ -201,10 +201,8 @@ run_status_capture() {
         return 0
     fi
     err_file=$(mktemp)
-    set +e
-    output=$("$@" 2>"${err_file}")
-    rc=$?
-    set -e
+    rc=0
+    output=$("$@" 2>"${err_file}") || rc=$?
     if [[ ${rc} -ne 0 ]]; then
         err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
         log_warn "${label} failed: ${err_msg:-unknown}"
