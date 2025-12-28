@@ -1946,9 +1946,10 @@ ${marker}
   - (Optional) External scans should NOT show these ports.
 
 ## 3. Connect to admin services (after VPN is up)
-- NPM Admin: http://${vpn_ip}:${npm_port}
-- Uptime Kuma: http://${vpn_ip}:${kuma_port}
-- Gotify: http://${vpn_ip}:${gotify_port}
+- Use a browser (or SSH tunnel if preferred) after VPN is up to configure each service:
+  - NPM Admin: http://${vpn_ip}:${npm_port}
+  - Uptime Kuma: http://${vpn_ip}:${kuma_port}
+  - Gotify: http://${vpn_ip}:${gotify_port}
 
 ## 4. OPTIONAL (after verifying VPN works)
 - Restrict SSH to the VPN only (keep console/rescue for break-glass access):
