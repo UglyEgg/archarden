@@ -113,74 +113,6 @@ initialize_run_context() {
     backup_init_run_dir
 }
 
-ensure_fail2ban_sshd_local() {
-    local target=/etc/fail2ban/jail.d/sshd.local
-    local tmp_base tmp_other tmp_out current_section section_lower
-
-    tmp_base=$(mktemp)
-    tmp_other=$(mktemp)
-    tmp_out=$(mktemp)
-
-    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/fail2ban_sshd.local" > "${tmp_base}"
-
-    if [[ -f "${target}" ]]; then
-        current_section=""
-        while IFS= read -r line || [[ -n "${line}" ]]; do
-            if [[ "${line}" =~ ^\[([^]]+)\] ]]; then
-                current_section="${BASH_REMATCH[1]}"
-            fi
-            section_lower=${current_section,,}
-            if [[ "${section_lower}" != "default" && "${section_lower}" != "sshd" ]]; then
-                echo "${line}" >>"${tmp_other}"
-            fi
-        done < "${target}"
-    fi
-
-    cat "${tmp_base}" > "${tmp_out}"
-    if [[ -s "${tmp_other}" ]]; then
-        echo >>"${tmp_out}"
-        cat "${tmp_other}" >>"${tmp_out}"
-    fi
-
-    write_file_atomic "${target}" < "${tmp_out}"
-    rm -f "${tmp_base}" "${tmp_other}" "${tmp_out}"
-    run_cmd "chown root:root ${target}"
-}
-
-ensure_fail2ban_defaults_local() {
-    local target=/etc/fail2ban/jail.local
-    local tmp_base tmp_other tmp_out current_section section_lower
-
-    tmp_base=$(mktemp)
-    tmp_other=$(mktemp)
-    tmp_out=$(mktemp)
-
-    cat "${CONFIG_DIR}/fail2ban_jail.local" > "${tmp_base}"
-
-    if [[ -f "${target}" ]]; then
-        current_section=""
-        while IFS= read -r line || [[ -n "${line}" ]]; do
-            if [[ "${line}" =~ ^\[([^]]+)\] ]]; then
-                current_section="${BASH_REMATCH[1]}"
-            fi
-            section_lower=${current_section,,}
-            if [[ "${section_lower}" != "default" ]]; then
-                echo "${line}" >>"${tmp_other}"
-            fi
-        done < "${target}"
-    fi
-
-    cat "${tmp_base}" > "${tmp_out}"
-    if [[ -s "${tmp_other}" ]]; then
-        echo >>"${tmp_out}"
-        cat "${tmp_other}" >>"${tmp_out}"
-    fi
-
-    write_file_atomic "${target}" < "${tmp_out}"
-    rm -f "${tmp_base}" "${tmp_other}" "${tmp_out}"
-    run_cmd "chown root:root ${target}"
-}
-
 run_status_capture() {
     local label="$1"; shift
     local err_file output rc err_msg
@@ -200,29 +132,6 @@ run_status_capture() {
         done <<<"${output:-ok}"
     fi
     rm -f "${err_file}"
-}
-
-configure_fail2ban() {
-    if [[ ${ENABLE_FAIL2BAN} -eq 0 ]]; then
-        log_warn "Fail2ban disabled by flag"
-        return
-    fi
-    backup_file /etc/fail2ban/jail.local
-    backup_file /etc/fail2ban/jail.d/sshd.local
-    run_cmd "install -d -m 0755 /etc/fail2ban/jail.d"
-    ensure_fail2ban_defaults_local
-    ensure_fail2ban_sshd_local
-    run_cmd "systemctl enable --now fail2ban.service"
-    run_cmd "systemctl restart fail2ban.service"
-    if command -v ufw >/dev/null 2>&1; then
-        if ! ufw status 2>/dev/null | grep -qi "Status: active"; then
-            log_warn "ufw is not active; banaction=ufw will not take effect until ufw is enabled"
-        else
-            run_status_capture "ufw status numbered" ufw status numbered
-        fi
-    fi
-    run_status_capture "fail2ban-client status" fail2ban-client status
-    run_status_capture "fail2ban-client status sshd" fail2ban-client status sshd
 }
 
 configure_podman_templates() {
@@ -1334,82 +1243,6 @@ configure_wireguard() {
     log_info "WireGuard client configs available under /root/wireguard/clients"
 }
 
-configure_ufw() {
-    if [[ ${ENABLE_FIREWALL} -eq 0 ]]; then
-        log_warn "Firewall configuration disabled by flag"
-        return
-    fi
-    ensure_wireguard_config_loaded
-    ensure_firewall_backend
-
-    if ! command -v ufw >/dev/null 2>&1; then
-        log_error "ufw command not found; install the ufw package."
-        exit 1
-    fi
-
-    backup_file /etc/default/ufw
-    run_cmd "sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw"
-    run_cmd "ufw --force reset"
-    run_cmd "ufw default deny incoming"
-    run_cmd "ufw default allow outgoing"
-
-    if ufw --version 2>/dev/null | grep -qi nftables; then
-        log_info "UFW reports nftables backend"
-    else
-        log_warn "UFW backend is not reporting nftables; ensure iptables-nft is the active alternative."
-    fi
-
-    if [[ -n "${RESTRICT_SSH_CIDR}" ]]; then
-        run_cmd "ufw allow from ${RESTRICT_SSH_CIDR} to any port ${SSH_PORT} proto tcp"
-    else
-        run_cmd "ufw limit ${SSH_PORT}/tcp"
-    fi
-
-    if ss -tulpn 2>/dev/null | grep -q ':22'; then
-        run_cmd "ufw allow 22/tcp"
-    fi
-    if [[ ${KEEP_SSH_22} -eq 1 ]]; then
-        run_cmd "ufw allow 22/tcp"
-    fi
-
-    local allowlist_entries=()
-    while IFS= read -r port; do
-        allowlist_entries+=("${port}")
-    done < <(read_packages_from_file "${CONFIG_DIR}/firewall_allow.list" 1)
-
-    if [[ ${#allowlist_entries[@]} -eq 0 ]]; then
-        log_warn "No firewall allowlist entries defined; skipping port allows"
-    else
-        for port in "${allowlist_entries[@]}"; do
-            run_cmd "ufw allow ${port}"
-        done
-    fi
-
-    run_cmd "ufw allow ${WG_LISTEN_PORT}/udp comment 'WireGuard'"
-    run_cmd "ufw allow in on wg0 to any port 81 proto tcp comment 'NPM Admin (VPN)'"
-    run_cmd "ufw allow in on wg0 to any port 3001 proto tcp comment 'Uptime Kuma (VPN)'"
-
-    if [[ ${SKIP_FIREWALL_ENABLE} -eq 1 ]]; then
-        log_warn "Skipping firewall enable as requested"
-        return
-    fi
-
-    run_cmd "ufw --force enable"
-    if command -v systemctl >/dev/null 2>&1; then
-        run_cmd "systemctl enable --now ufw"
-    else
-        log_warn "systemctl not found; ensure ufw starts on boot"
-    fi
-    if [[ ${KEEP_SSH_22} -eq 0 ]]; then
-        if [ "${DRY_RUN}" -eq 0 ]; then
-            ufw delete allow 22/tcp >/dev/null 2>&1 || true
-        else
-            log_info "[DRY-RUN] Would remove legacy SSH port 22 rule"
-        fi
-    fi
-    run_cmd "ufw reload"
-}
-
 ensure_podmin_user() {
     local expected_home="/home/${PODMAN_USER}" current_home current_shell
     if id -u "${PODMAN_USER}" >/dev/null 2>&1; then
@@ -1450,36 +1283,6 @@ ensure_podmin_user() {
     if ! loginctl enable-linger "${PODMAN_USER}" >/dev/null 2>&1; then
         log_warn "Could not enable linger for ${PODMAN_USER}; rootless services may not restart after reboot"
     fi
-}
-
-ensure_firewall_backend() {
-    if ! command -v nft >/dev/null 2>&1; then
-        log_error "nft command not found; firewall configuration cannot continue."
-        exit 1
-    fi
-
-    if nft list tables >/dev/null 2>&1; then
-        return
-    fi
-
-    log_warn "nftables backend unavailable; attempting to load firewall kernel modules"
-    local modules=()
-    while IFS= read -r mod; do
-        modules+=("${mod}")
-    done < <(read_packages_from_file "${CONFIG_DIR}/firewall_modules.list")
-    for mod in "${modules[@]}"; do
-        if modinfo "${mod}" >/dev/null 2>&1; then
-            run_cmd "modprobe ${mod} || true"
-        fi
-    done
-
-    if nft list tables >/dev/null 2>&1; then
-        log_info "Firewall kernel modules loaded successfully"
-        return
-    fi
-
-    log_error "nftables backend still unavailable. Ensure firewall kernel modules are present or rerun with --skip-firewall-enable or --disable-firewall."
-    exit 1
 }
 
 ensure_grub_defaults_saved() {
