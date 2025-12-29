@@ -22,18 +22,19 @@ done
 
 DEFAULT_INSTALL_PREFIX="/usr/local/lib/vps-harden"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-if [[ ! -f "${SCRIPT_DIR}/lib/utils.sh" ]]; then
+if [[ ! -f "${SCRIPT_DIR}/lib/loader.sh" ]]; then
     FALLBACK_DIR="${DEFAULT_INSTALL_PREFIX}"
-    if [[ -f "${FALLBACK_DIR}/lib/utils.sh" ]]; then
+    if [[ -f "${FALLBACK_DIR}/lib/loader.sh" ]]; then
         SCRIPT_DIR="${FALLBACK_DIR}"
     else
-        printf 'Required helper not found: %s\n' "${SCRIPT_DIR}/lib/utils.sh" >&2
+        printf 'Required helper not found: %s\n' "${SCRIPT_DIR}/lib/loader.sh" >&2
         exit 1
     fi
 fi
 CONFIG_DIR="${SCRIPT_DIR}/config"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
-source "${SCRIPT_DIR}/lib/utils.sh"
+source "${SCRIPT_DIR}/lib/loader.sh"
+source_libs
 
 DRY_RUN=0
 ENABLE_FAIL2BAN=1
@@ -88,19 +89,6 @@ clear_pending_state() {
     rm -f "${PENDING_ARGS_FILE}"
 }
 
-ensure_backup_root() {
-    if [[ -z "${BACKUP_ROOT:-}" ]]; then
-        log_error "BACKUP_ROOT is not set; initialize run context before creating backups."
-        exit 1
-    fi
-    if [[ ${DRY_RUN} -eq 1 ]]; then
-        log_info "[DRY-RUN] Would ensure backup root at ${BACKUP_ROOT}"
-        return
-    fi
-    run_cmd "install -d -m 0700 -o root -g root \"${BACKUP_ROOT_BASE}\""
-    run_cmd "install -d -m 0700 -o root -g root \"${BACKUP_ROOT}\""
-}
-
 initialize_run_context() {
     local ts existing_run_id=""
     if [[ -z "${RUN_ID:-}" && ${RESUME_MODE:-0} -eq 1 && -s "${RUN_ID_FILE}" ]]; then
@@ -122,7 +110,7 @@ initialize_run_context() {
     run_cmd "install -d -m 0700 -o root -g root \"${STATE_DIR}\""
     run_cmd "install -m 0600 /dev/null \"${RUN_ID_FILE}\""
     echo "${RUN_ID}" > "${RUN_ID_FILE}"
-    ensure_backup_root
+    backup_init_run_dir
 }
 
 ensure_fail2ban_sshd_local() {
