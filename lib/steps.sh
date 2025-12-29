@@ -152,36 +152,179 @@ ensure_quadlet_generator() {
     return 0
 }
 
-ensure_npm_quadlet() {
-    local user_home systemd_dir target input tmp_out
-    user_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
-    if [[ -z "${user_home}" ]]; then
+quadlet::user_home() {
+    local podmin_home
+    podmin_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
+    if [[ -z "${podmin_home}" ]]; then
         log_error "Unable to determine home for ${PODMAN_USER}"
         exit 1
     fi
-    systemd_dir="${user_home}/.config/containers/systemd"
-    target="${systemd_dir}/nginx-proxy-manager.container"
-    input="${target}"
-    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${user_home}/.config ${user_home}/.config/containers ${systemd_dir}"
-    if [[ ! -f "${input}" ]]; then
-        input="${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
+    echo "${podmin_home}"
+}
+
+quadlet::systemd_dir() {
+    local home
+    home=$(quadlet::user_home)
+    echo "${home}/.config/containers/systemd"
+}
+
+quadlet::render() {
+    local template="$1" dest="$2"
+    local tmp dir
+    dir=$(dirname "${dest}")
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${dir}"
+    tmp=$(mktemp)
+    if [[ -f "${dest}" ]]; then
+        cp "${dest}" "${tmp}"
+    else
+        cp "${template}" "${tmp}"
+    fi
+    echo "${tmp}"
+}
+
+quadlet::apply_limits() {
+    local dest="$1"; shift
+    local tmp_out in_container=0
+    declare -A desired=()
+    declare -A seen=()
+    local -a desired_keys=()
+    local key value kv
+    for kv in "$@"; do
+        key=${kv%%=*}
+        value=${kv#*=}
+        desired["${key}"]="${value}"
+        seen["${key}"]=0
+        desired_keys+=("${key}")
+    done
+    tmp_out=$(mktemp)
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^\[.*\] ]]; then
+            if [[ ${in_container} -eq 1 ]]; then
+                for key in "${desired_keys[@]}"; do
+                    if [[ ${seen[${key}]} -eq 0 ]]; then
+                        echo "${key}=${desired[${key}]}" >>"${tmp_out}"
+                    fi
+                done
+            fi
+            in_container=0
+        fi
+
+        if [[ "${line}" == "[Container]" ]]; then
+            in_container=1
+            for key in "${desired_keys[@]}"; do
+                seen["${key}"]=0
+            done
+        elif [[ ${in_container} -eq 1 ]]; then
+            for key in "${desired_keys[@]}"; do
+                if [[ "${line}" =~ ^${key}= ]]; then
+                    case "${key}" in
+                        PodmanArgs)
+                            if [[ "${line}" != *"${desired[${key}]}"* ]]; then
+                                line="${line} ${desired[${key}]}"
+                            fi
+                            ;;
+                        *)
+                            line="${key}=${desired[${key}]}"
+                            ;;
+                    esac
+                    seen["${key}"]=1
+                    break
+                fi
+            done
+        fi
+
+        echo "${line}" >>"${tmp_out}"
+    done < "${dest}"
+
+    if [[ ${in_container} -eq 1 ]]; then
+        for key in "${desired_keys[@]}"; do
+            if [[ ${seen[${key}]} -eq 0 ]]; then
+                echo "${key}=${desired[${key}]}" >>"${tmp_out}"
+            fi
+        done
     fi
 
-    tmp_out=$(mktemp)
-    local in_container=0 saw_memory=0 saw_pids=0 saw_podmanargs=0
-    local in_install=0 saw_install=0 saw_install_wanted_by=0 saw_install_default_target=0
-    local -a required_ports=("127.0.0.1:8181:81" "127.0.0.1:8080:80" "127.0.0.1:8443:443")
-    declare -A port_seen
-    for port in "${required_ports[@]}"; do
-        port_seen["${port}"]=0
-    done
+    write_file_atomic "${dest}" < "${tmp_out}"
+    rm -f "${tmp_out}"
+}
 
+quadlet::ensure_install_default_target() {
+    local dest="$1"
+    local tmp_out in_install=0 saw_install=0 saw_install_default_target=0
+    tmp_out=$(mktemp)
     while IFS= read -r line || [[ -n "${line}" ]]; do
         if [[ "${line}" =~ ^\[.*\] ]]; then
             if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
                 echo "WantedBy=default.target" >>"${tmp_out}"
                 saw_install_default_target=1
             fi
+            in_install=0
+        fi
+
+        if [[ "${line}" == "[Install]" ]]; then
+            in_install=1
+            saw_install=1
+        elif [[ ${in_install} -eq 1 && "${line}" =~ ^WantedBy= ]]; then
+            if [[ "${line#WantedBy=}" == *"default.target"* ]]; then
+                saw_install_default_target=1
+            fi
+        fi
+
+        echo "${line}" >>"${tmp_out}"
+    done < "${dest}"
+
+    if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
+        echo "WantedBy=default.target" >>"${tmp_out}"
+        saw_install_default_target=1
+    fi
+
+    if [[ ${saw_install} -eq 0 ]]; then
+        echo >>"${tmp_out}"
+        echo "[Install]" >>"${tmp_out}"
+        echo "WantedBy=default.target" >>"${tmp_out}"
+    elif [[ ${saw_install_default_target} -eq 0 ]]; then
+        echo "WantedBy=default.target" >>"${tmp_out}"
+    fi
+
+    write_file_atomic "${dest}" < "${tmp_out}"
+    rm -f "${tmp_out}"
+}
+
+quadlet::write_unit() {
+    local target="$1" source_tmp="$2"
+    write_file_atomic "${target}" < "${source_tmp}"
+    ensure_file_permissions "${target}" 0644 "${PODMAN_USER}"
+}
+
+quadlet::enable() {
+    local user="$1" service="$2"
+    if [[ "${user}" == "${PODMAN_USER}" ]]; then
+        if ! podmin_systemctl start "${service}"; then
+            log_warn "Failed to start ${service} for ${user}; rootless services may not be active"
+            return
+        fi
+        verify_quadlet_status "${service}"
+        return
+    fi
+    run_cmd "runuser -u ${user} -- systemctl --user start ${service}"
+}
+
+ensure_npm_quadlet() {
+    local systemd_dir target tmp_out tmp_in
+    systemd_dir=$(quadlet::systemd_dir)
+    target="${systemd_dir}/nginx-proxy-manager.container"
+    tmp_in=$(quadlet::render "${TEMPLATES_DIR}/containers/nginx-proxy-manager.container" "${target}")
+
+    tmp_out=$(mktemp)
+    local in_container=0
+    local -a required_ports=("127.0.0.1:8181:81" "127.0.0.1:8080:80" "127.0.0.1:8443:443")
+    declare -A port_seen=()
+    for port in "${required_ports[@]}"; do
+        port_seen["${port}"]=0
+    done
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^\[.*\] ]]; then
             if [[ ${in_container} -eq 1 ]]; then
                 for port in "${required_ports[@]}"; do
                     if [[ ${port_seen[${port}]} -eq 0 ]]; then
@@ -189,24 +332,8 @@ ensure_npm_quadlet() {
                         port_seen["${port}"]=1
                     fi
                 done
-                if [[ ${saw_memory} -eq 0 ]]; then
-                    echo "Memory=512M" >>"${tmp_out}"
-                fi
-                if [[ ${saw_pids} -eq 0 ]]; then
-                    echo "PidsLimit=512" >>"${tmp_out}"
-                fi
-                if [[ ${saw_podmanargs} -eq 0 ]]; then
-                    echo "PodmanArgs=--memory-swap=1G" >>"${tmp_out}"
-                fi
             fi
             in_container=0
-            in_install=0
-        fi
-
-        if [[ "${line}" =~ ^\[Install\]$ ]]; then
-            in_install=1
-            saw_install=1
-            saw_install_wanted_by=0
         fi
 
         if [[ ${in_container} -eq 1 ]]; then
@@ -226,40 +353,10 @@ ensure_npm_quadlet() {
                 continue
             fi
 
-            if [[ "${line}" =~ ^Memory= ]]; then
-                if [[ ${saw_memory} -eq 1 ]]; then
-                    continue
-                fi
-                line="Memory=512M"
-                saw_memory=1
-            fi
-            if [[ "${line}" =~ ^PidsLimit= ]]; then
-                if [[ ${saw_pids} -eq 1 ]]; then
-                    continue
-                fi
-                line="PidsLimit=512"
-                saw_pids=1
-            fi
             if [[ "${line}" =~ ^Network= ]]; then
                 if [[ "${line}" == "Network=host" ]]; then
                     line="Network=slirp4netns"
                 fi
-            fi
-            if [[ "${line}" =~ ^PodmanArgs= ]]; then
-                if [[ ${saw_podmanargs} -eq 1 ]]; then
-                    continue
-                fi
-                saw_podmanargs=1
-                if [[ "${line}" != *"--memory-swap=1G"* ]]; then
-                    line="${line} --memory-swap=1G"
-                fi
-            fi
-        fi
-
-        if [[ ${in_install} -eq 1 && "${line}" =~ ^WantedBy= ]]; then
-            saw_install_wanted_by=1
-            if [[ "${line#WantedBy=}" == *"default.target"* ]]; then
-                saw_install_default_target=1
             fi
         fi
 
@@ -267,19 +364,11 @@ ensure_npm_quadlet() {
 
         if [[ "${line}" == "[Container]" ]]; then
             in_container=1
-            saw_memory=0
-            saw_pids=0
-            saw_podmanargs=0
             for port in "${required_ports[@]}"; do
                 port_seen["${port}"]=0
             done
         fi
-    done < "${input}"
-
-    if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
-        echo "WantedBy=default.target" >>"${tmp_out}"
-        saw_install_default_target=1
-    fi
+    done < "${tmp_in}"
 
     if [[ ${in_container} -eq 1 ]]; then
         for port in "${required_ports[@]}"; do
@@ -287,162 +376,37 @@ ensure_npm_quadlet() {
                 echo "PublishPort=${port}" >>"${tmp_out}"
             fi
         done
-        if [[ ${saw_memory} -eq 0 ]]; then
-            echo "Memory=512M" >>"${tmp_out}"
-        fi
-        if [[ ${saw_pids} -eq 0 ]]; then
-            echo "PidsLimit=512" >>"${tmp_out}"
-        fi
-        if [[ ${saw_podmanargs} -eq 0 ]]; then
-            echo "PodmanArgs=--memory-swap=1G" >>"${tmp_out}"
-        fi
     fi
 
-    if [[ ${saw_install} -eq 0 ]]; then
-        echo >>"${tmp_out}"
-        echo "[Install]" >>"${tmp_out}"
-        echo "WantedBy=default.target" >>"${tmp_out}"
-    elif [[ ${saw_install_default_target} -eq 0 ]]; then
-        echo "WantedBy=default.target" >>"${tmp_out}"
-        saw_install_default_target=1
-    fi
-
-    write_file_atomic "${target}" < "${tmp_out}"
-    rm -f "${tmp_out}"
-    run_cmd "chown ${PODMAN_USER}:${PODMAN_USER} ${target}"
-    run_cmd "chmod 0644 ${target}"
+    quadlet::write_unit "${target}" "${tmp_out}"
+    quadlet::ensure_install_default_target "${target}"
+    quadlet::apply_limits "${target}" "Memory=512M" "PidsLimit=512" "PodmanArgs=--memory-swap=1G"
+    rm -f "${tmp_in}" "${tmp_out}"
 }
 
 ensure_gotify_quadlet() {
-    local user_home systemd_dir target input tmp_out
-    user_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
-    if [[ -z "${user_home}" ]]; then
-        log_error "Unable to determine home for ${PODMAN_USER}"
-        exit 1
-    fi
-    systemd_dir="${user_home}/.config/containers/systemd"
+    local systemd_dir target tmp_in
+    systemd_dir=$(quadlet::systemd_dir)
     target="${systemd_dir}/gotify.container"
-    input="${target}"
-    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${user_home}/.config ${user_home}/.config/containers ${systemd_dir}"
-    if [[ ! -f "${input}" ]]; then
-        input="${TEMPLATES_DIR}/containers/gotify.container"
-    fi
+    tmp_in=$(quadlet::render "${TEMPLATES_DIR}/containers/gotify.container" "${target}")
 
-    tmp_out=$(mktemp)
-    local in_container=0 saw_memory=0 saw_pids=0
-    local in_install=0 saw_install=0 saw_install_wanted_by=0 saw_install_default_target=0
-
-    while IFS= read -r line || [[ -n "${line}" ]]; do
-        if [[ "${line}" =~ ^\[.*\] ]]; then
-            if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
-                echo "WantedBy=default.target" >>"${tmp_out}"
-                saw_install_default_target=1
-            fi
-            if [[ ${in_container} -eq 1 ]]; then
-                if [[ ${saw_memory} -eq 0 ]]; then
-                    echo "Memory=128M" >>"${tmp_out}"
-                fi
-                if [[ ${saw_pids} -eq 0 ]]; then
-                    echo "PidsLimit=256" >>"${tmp_out}"
-                fi
-            fi
-            in_container=0
-            in_install=0
-        fi
-
-        if [[ "${line}" =~ ^\[Install\]$ ]]; then
-            in_install=1
-            saw_install=1
-            saw_install_wanted_by=0
-        fi
-
-        if [[ ${in_container} -eq 1 ]]; then
-            if [[ "${line}" =~ ^Memory= ]]; then
-                if [[ ${saw_memory} -eq 1 ]]; then
-                    continue
-                fi
-                line="Memory=128M"
-                saw_memory=1
-            fi
-            if [[ "${line}" =~ ^PidsLimit= ]]; then
-                if [[ ${saw_pids} -eq 1 ]]; then
-                    continue
-                fi
-                line="PidsLimit=256"
-                saw_pids=1
-            fi
-        fi
-
-        if [[ ${in_install} -eq 1 && "${line}" =~ ^WantedBy= ]]; then
-            saw_install_wanted_by=1
-            if [[ "${line#WantedBy=}" == *"default.target"* ]]; then
-                saw_install_default_target=1
-            fi
-        fi
-
-        echo "${line}" >>"${tmp_out}"
-
-        if [[ "${line}" == "[Container]" ]]; then
-            in_container=1
-            saw_memory=0
-            saw_pids=0
-        fi
-    done < "${input}"
-
-    if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
-        echo "WantedBy=default.target" >>"${tmp_out}"
-        saw_install_default_target=1
-    fi
-
-    if [[ ${in_container} -eq 1 ]]; then
-        if [[ ${saw_memory} -eq 0 ]]; then
-            echo "Memory=128M" >>"${tmp_out}"
-        fi
-        if [[ ${saw_pids} -eq 0 ]]; then
-            echo "PidsLimit=256" >>"${tmp_out}"
-        fi
-    fi
-
-    if [[ ${saw_install} -eq 0 ]]; then
-        echo >>"${tmp_out}"
-        echo "[Install]" >>"${tmp_out}"
-        echo "WantedBy=default.target" >>"${tmp_out}"
-    elif [[ ${saw_install_default_target} -eq 0 ]]; then
-        echo "WantedBy=default.target" >>"${tmp_out}"
-        saw_install_default_target=1
-    fi
-
-    write_file_atomic "${target}" < "${tmp_out}"
-    rm -f "${tmp_out}"
-    run_cmd "chown ${PODMAN_USER}:${PODMAN_USER} ${target}"
-    run_cmd "chmod 0644 ${target}"
+    quadlet::write_unit "${target}" "${tmp_in}"
+    quadlet::ensure_install_default_target "${target}"
+    quadlet::apply_limits "${target}" "Memory=128M" "PidsLimit=256"
+    rm -f "${tmp_in}"
 }
 
 ensure_uptime_kuma_quadlet() {
-    local user_home systemd_dir target input tmp_out
-    user_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
-    if [[ -z "${user_home}" ]]; then
-        log_error "Unable to determine home for ${PODMAN_USER}"
-        exit 1
-    fi
-    systemd_dir="${user_home}/.config/containers/systemd"
+    local systemd_dir target tmp_out tmp_in
+    systemd_dir=$(quadlet::systemd_dir)
     target="${systemd_dir}/uptime-kuma.container"
-    input="${target}"
-    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${user_home}/.config ${user_home}/.config/containers ${systemd_dir}"
-    if [[ ! -f "${input}" ]]; then
-        input="${TEMPLATES_DIR}/containers/uptime-kuma.container"
-    fi
+    tmp_in=$(quadlet::render "${TEMPLATES_DIR}/containers/uptime-kuma.container" "${target}")
 
     tmp_out=$(mktemp)
     local in_container=0 saw_publish=0 saw_volume=0 saw_autoupdate=0 saw_image=0
-    local in_install=0 saw_install=0 saw_install_default_target=0
 
     while IFS= read -r line || [[ -n "${line}" ]]; do
         if [[ "${line}" =~ ^\[.*\] ]]; then
-            if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
-                echo "WantedBy=default.target" >>"${tmp_out}"
-                saw_install_default_target=1
-            fi
             if [[ ${in_container} -eq 1 ]]; then
                 if [[ ${saw_image} -eq 0 ]]; then
                     echo "Image=docker.io/louislam/uptime-kuma:2" >>"${tmp_out}"
@@ -458,12 +422,6 @@ ensure_uptime_kuma_quadlet() {
                 fi
             fi
             in_container=0
-            in_install=0
-        fi
-
-        if [[ "${line}" =~ ^\[Install\]$ ]]; then
-            in_install=1
-            saw_install=1
         fi
 
         if [[ ${in_container} -eq 1 ]]; then
@@ -485,12 +443,6 @@ ensure_uptime_kuma_quadlet() {
             fi
         fi
 
-        if [[ ${in_install} -eq 1 && "${line}" =~ ^WantedBy= ]]; then
-            if [[ "${line#WantedBy=}" == *"default.target"* ]]; then
-                saw_install_default_target=1
-            fi
-        fi
-
         echo "${line}" >>"${tmp_out}"
 
         if [[ "${line}" == "[Container]" ]]; then
@@ -500,12 +452,7 @@ ensure_uptime_kuma_quadlet() {
             saw_autoupdate=0
             saw_image=0
         fi
-    done < "${input}"
-
-    if [[ ${in_install} -eq 1 && ${saw_install_default_target} -eq 0 ]]; then
-        echo "WantedBy=default.target" >>"${tmp_out}"
-        saw_install_default_target=1
-    fi
+    done < "${tmp_in}"
 
     if [[ ${in_container} -eq 1 ]]; then
         if [[ ${saw_image} -eq 0 ]]; then
@@ -522,19 +469,9 @@ ensure_uptime_kuma_quadlet() {
         fi
     fi
 
-    if [[ ${saw_install} -eq 0 ]]; then
-        echo >>"${tmp_out}"
-        echo "[Install]" >>"${tmp_out}"
-        echo "WantedBy=default.target" >>"${tmp_out}"
-    elif [[ ${saw_install_default_target} -eq 0 ]]; then
-        echo "WantedBy=default.target" >>"${tmp_out}"
-        saw_install_default_target=1
-    fi
-
-    write_file_atomic "${target}" < "${tmp_out}"
-    rm -f "${tmp_out}"
-    run_cmd "chown ${PODMAN_USER}:${PODMAN_USER} ${target}"
-    run_cmd "chmod 0644 ${target}"
+    quadlet::write_unit "${target}" "${tmp_out}"
+    quadlet::ensure_install_default_target "${target}"
+    rm -f "${tmp_in}" "${tmp_out}"
 }
 
 verify_quadlet_status() {
@@ -559,21 +496,9 @@ configure_rootless_quadlets() {
     if ! podmin_systemctl daemon-reload; then
         log_warn "Failed to reload user systemd daemon for ${PODMAN_USER}; rootless services may not be active"
     fi
-    if ! podmin_systemctl start nginx-proxy-manager.service; then
-        log_warn "Failed to start nginx-proxy-manager.service for ${PODMAN_USER}; rootless services may not be active"
-    else
-        verify_quadlet_status nginx-proxy-manager.service
-    fi
-    if ! podmin_systemctl start gotify.service; then
-        log_warn "Failed to start gotify.service for ${PODMAN_USER}; rootless services may not be active"
-    else
-        verify_quadlet_status gotify.service
-    fi
-    if ! podmin_systemctl start uptime-kuma.service; then
-        log_warn "Failed to start uptime-kuma.service for ${PODMAN_USER}; rootless services may not be active"
-    else
-        verify_quadlet_status uptime-kuma.service
-    fi
+    quadlet::enable "${PODMAN_USER}" "nginx-proxy-manager.service"
+    quadlet::enable "${PODMAN_USER}" "gotify.service"
+    quadlet::enable "${PODMAN_USER}" "uptime-kuma.service"
 }
 
 configure_socket_proxyd() {
@@ -690,30 +615,37 @@ EOT
     run_cmd "systemctl enable --now podmin-podman.socket"
 }
 
-configure_gotify_notifications() {
+gotify::ensure_container_running() {
+    verify_quadlet_status gotify.service
+}
+
+gotify::ensure_token() {
     local env_file=/etc/archarden/notify-gotify.env
-    local lib_dir=/usr/local/lib/archarden
-    local os_report_service=/etc/systemd/system/archarden-os-report.service
-    local os_report_timer=/etc/systemd/system/archarden-os-report.timer
-    local container_scan_service=/etc/systemd/system/archarden-container-scan.service
-    local container_scan_timer=/etc/systemd/system/archarden-container-scan.timer
-
     run_cmd "install -d -m 0700 /etc/archarden"
-    run_cmd "install -d -m 0750 ${lib_dir}"
-
-    if [[ ! -f "${env_file}" ]]; then
-        write_file_atomic "${env_file}" <<'EOT'
+    ensure_file_exists "${env_file}" 0600 root root <<'EOT'
 # Gotify endpoint and access token (leave blank to disable notifications)
 GOTIFY_URL=
 GOTIFY_TOKEN=
 # Optional priority (default 5)
 GOTIFY_PRIORITY=5
 EOT
-    fi
-    run_cmd "chmod 0600 ${env_file}"
-    run_cmd "chown root:root ${env_file}"
+}
 
-    write_file_atomic "${lib_dir}/gotify_send.sh" <<'EOT'
+gotify::ensure_lib_dir() {
+    local lib_dir=/usr/local/lib/archarden
+    run_cmd "install -d -m 0750 ${lib_dir}"
+}
+
+gotify::write_root_file() {
+    local path="$1" mode="$2"
+    write_file_atomic "${path}"
+    ensure_file_permissions "${path}" "${mode}" root
+}
+
+gotify::install_notify_script() {
+    local lib_dir=/usr/local/lib/archarden
+    gotify::ensure_lib_dir
+    gotify::write_root_file "${lib_dir}/gotify_send.sh" 0750 <<'EOT'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -748,10 +680,17 @@ if ! curl -fsS -X POST "${GOTIFY_URL%/}/message?token=${GOTIFY_TOKEN}" \
   echo "Failed to send Gotify notification" >&2
 fi
 EOT
-    run_cmd "chmod 0750 ${lib_dir}/gotify_send.sh"
-    run_cmd "chown root:root ${lib_dir}/gotify_send.sh"
+}
 
-    write_file_atomic "${lib_dir}/os_update_report.sh" <<'EOT'
+gotify::install_units() {
+    local lib_dir=/usr/local/lib/archarden
+    local os_report_service=/etc/systemd/system/archarden-os-report.service
+    local os_report_timer=/etc/systemd/system/archarden-os-report.timer
+    local container_scan_service=/etc/systemd/system/archarden-container-scan.service
+    local container_scan_timer=/etc/systemd/system/archarden-container-scan.timer
+
+    gotify::ensure_lib_dir
+    gotify::write_root_file "${lib_dir}/os_update_report.sh" 0750 <<'EOT'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -797,10 +736,8 @@ fi
 
 "${notify_bin}" "Arch updates and advisories" "${message}"
 EOT
-    run_cmd "chmod 0750 ${lib_dir}/os_update_report.sh"
-    run_cmd "chown root:root ${lib_dir}/os_update_report.sh"
 
-    write_file_atomic "${lib_dir}/container_update_scan.sh" <<'EOT'
+    gotify::write_root_file "${lib_dir}/container_update_scan.sh" 0750 <<'EOT'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -848,10 +785,8 @@ fi
 
 "${notify_bin}" "Container updates available" "${message}"
 EOT
-    run_cmd "chmod 0750 ${lib_dir}/container_update_scan.sh"
-    run_cmd "chown root:root ${lib_dir}/container_update_scan.sh"
 
-    write_file_atomic "${os_report_service}" <<'EOT'
+    gotify::write_root_file "${os_report_service}" 0644 <<'EOT'
 [Unit]
 Description=Archarden daily OS update and advisory report
 After=network-online.target
@@ -862,7 +797,7 @@ Type=oneshot
 ExecStart=/usr/local/lib/archarden/os_update_report.sh
 EOT
 
-    write_file_atomic "${os_report_timer}" <<'EOT'
+    gotify::write_root_file "${os_report_timer}" 0644 <<'EOT'
 [Unit]
 Description=Run archarden OS update report daily
 
@@ -874,7 +809,7 @@ Persistent=true
 WantedBy=timers.target
 EOT
 
-    write_file_atomic "${container_scan_service}" <<'EOT'
+    gotify::write_root_file "${container_scan_service}" 0644 <<'EOT'
 [Unit]
 Description=Archarden weekly container update scan
 After=network-online.target
@@ -885,7 +820,7 @@ Type=oneshot
 ExecStart=/usr/local/lib/archarden/container_update_scan.sh
 EOT
 
-    write_file_atomic "${container_scan_timer}" <<'EOT'
+    gotify::write_root_file "${container_scan_timer}" 0644 <<'EOT'
 [Unit]
 Description=Run archarden container update scan weekly
 
@@ -896,12 +831,20 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOT
+}
 
-    run_cmd "chmod 0644 ${os_report_service} ${os_report_timer} ${container_scan_service} ${container_scan_timer}"
-    run_cmd "chown root:root ${os_report_service} ${os_report_timer} ${container_scan_service} ${container_scan_timer}"
+gotify::verify() {
     run_cmd "systemctl daemon-reload"
     run_cmd "systemctl enable --now archarden-os-report.timer"
     run_cmd "systemctl enable --now archarden-container-scan.timer"
+}
+
+configure_gotify_notifications() {
+    gotify::ensure_container_running
+    gotify::ensure_token
+    gotify::install_notify_script
+    gotify::install_units
+    gotify::verify
 }
 
 discover_public_ipv4() {
