@@ -10,4 +10,6 @@ source_libs() {
     source "${script_dir}/backup.sh"
     # shellcheck source=lib/system.sh
     source "${script_dir}/system.sh"
+    # shellcheck source=lib/ssh.sh
+    source "${script_dir}/ssh.sh"
 }
