@@ -8,4 +8,6 @@ source_libs() {
     source "${script_dir}/utils.sh"
     # shellcheck source=lib/backup.sh
     source "${script_dir}/backup.sh"
+    # shellcheck source=lib/system.sh
+    source "${script_dir}/system.sh"
 }
