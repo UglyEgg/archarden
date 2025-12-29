@@ -1,11 +1,13 @@
 SHELL := /bin/bash
 
 lint:
-	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck harden lib/utils.sh templates/containers/podman-run-npm.sh; \
-	else \
-		echo "shellcheck not installed; skipping"; \
-	fi
+	shellcheck harden lib/*.sh
+
+fmt:
+	shfmt -w harden lib/*.sh
+
+test:
+	bats test/
 
 install:
 	sudo ./harden $(EXTRA_FLAGS)
@@ -13,4 +15,4 @@ install:
 dry-run:
 	sudo ./harden --dry-run --non-interactive --skip-firewall-enable $(EXTRA_FLAGS)
 
-.PHONY: lint install dry-run
+.PHONY: lint fmt test install dry-run
