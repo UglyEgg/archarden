@@ -103,6 +103,41 @@ render_template() {
     rm -f "${tmp}"
 }
 
+ensure_file_permissions() {
+    local path="$1" mode="$2" owner="$3" group="${4:-$3}"
+    run_cmd "chown ${owner}:${group} ${path}"
+    run_cmd "chmod ${mode} ${path}"
+}
+
+write_config_from_repo() {
+    local dest="$1" source_rel="$2"
+    backup_file "${dest}"
+    write_file_atomic "${dest}" < "${CONFIG_DIR}/${source_rel}"
+}
+
+ensure_file_exists() {
+    local path="$1" mode="$2" owner="$3" group="${4:-$3}"
+    shift 4 || true
+    local has_stdin=1
+    if [[ -t 0 ]]; then
+        has_stdin=0
+    fi
+    if [[ ! -f "${path}" ]]; then
+        local tmp
+        tmp=$(mktemp)
+        if [[ ${has_stdin} -eq 1 ]]; then
+            cat > "${tmp}"
+        else
+            : > "${tmp}"
+        fi
+        write_file_atomic "${path}" < "${tmp}"
+        rm -f "${tmp}"
+    elif [[ ${has_stdin} -eq 1 ]]; then
+        cat >/dev/null || true
+    fi
+    ensure_file_permissions "${path}" "${mode}" "${owner}" "${group}"
+}
+
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         log_error "This script must be run as root."
