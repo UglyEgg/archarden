@@ -11,7 +11,11 @@ clear_pending_state() {
 
 initialize_run_context() {
     local ts existing_run_id=""
-    if [[ -z "${RUN_ID:-}" && ${RESUME_MODE:-0} -eq 1 && -s "${RUN_ID_FILE}" ]]; then
+    if [[ -z "${RUN_ID:-}" && ${RESUME_MODE:-0} -eq 1 ]]; then
+        if [[ ! -s "${RUN_ID_FILE}" ]]; then
+            log_error "Resume requested but run id missing at ${RUN_ID_FILE}; run phase 0 first."
+            exit 1
+        fi
         existing_run_id=$(cat "${RUN_ID_FILE}")
         RUN_ID="${existing_run_id}"
         log_info "Resuming with existing run id ${RUN_ID}"
@@ -137,19 +141,25 @@ ensure_quadlet_generator() {
     if [[ -z "${generator_dir}" ]]; then
         generator_dir="/usr/lib/systemd/user-generators"
     fi
-    generator_path="${generator_dir%/}/podman-system-generator"
+    local -a generator_candidates=(
+        "${generator_dir%/}/podman-user-generator"
+        "/usr/lib/systemd/system-generators/podman-system-generator"
+    )
 
     if [[ ${DRY_RUN} -eq 1 ]]; then
-        log_info "[DRY-RUN] Would check for podman quadlet generator at ${generator_path}"
+        log_info "[DRY-RUN] Would check for podman quadlet generator at: ${generator_candidates[*]}"
         return 0
     fi
 
-    if [[ ! -x "${generator_path}" ]]; then
-        log_warn "Podman quadlet generator not found at ${generator_path}; rootless quadlet services cannot start"
-        log_warn "Install podman with quadlet support (podman-quadlet or podman package including quadlet) and rerun the hardener"
-        return 1
-    fi
-    return 0
+    for generator_path in "${generator_candidates[@]}"; do
+        if [[ -x "${generator_path}" ]]; then
+            return 0
+        fi
+    done
+
+    log_warn "Podman quadlet generator not found; checked: ${generator_candidates[*]}"
+    log_warn "Install podman with quadlet support (podman-quadlet or podman package including quadlet) and rerun the hardener"
+    return 1
 }
 
 quadlet::user_home() {
@@ -172,7 +182,7 @@ quadlet::render() {
     local template="$1" dest="$2"
     local tmp dir
     dir=$(dirname "${dest}")
-    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${dir}"
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${dir}" >&2
     tmp=$(mktemp)
     if [[ -f "${dest}" ]]; then
         cp "${dest}" "${tmp}"
@@ -245,6 +255,7 @@ quadlet::apply_limits() {
     fi
 
     write_file_atomic "${dest}" < "${tmp_out}"
+    ensure_file_permissions "${dest}" 0644 "${PODMAN_USER}"
     rm -f "${tmp_out}"
 }
 
@@ -287,6 +298,7 @@ quadlet::ensure_install_default_target() {
     fi
 
     write_file_atomic "${dest}" < "${tmp_out}"
+    ensure_file_permissions "${dest}" 0644 "${PODMAN_USER}"
     rm -f "${tmp_out}"
 }
 
@@ -553,8 +565,29 @@ EOT
 }
 
 ensure_podmin_podman_socket() {
+    local -a podman_socket_units=(
+        /usr/lib/systemd/user/podman.socket
+        /etc/systemd/user/podman.socket
+    )
+    local have_socket_unit=0
+    local unit
+    for unit in "${podman_socket_units[@]}"; do
+        if [[ -f "${unit}" ]]; then
+            have_socket_unit=1
+            break
+        fi
+    done
+    if [[ ${have_socket_unit} -eq 0 ]]; then
+        log_warn "podman.socket unit missing; install podman with systemd user units to enable API proxy."
+        return 1
+    fi
+
     ensure_podmin_user_manager
-    podmin_systemctl enable --now podman.socket
+    if ! podmin_systemctl enable --now podman.socket; then
+        log_warn "Could not enable podman.socket for ${PODMAN_USER}; Podman API proxy will be skipped."
+        return 1
+    fi
+    return 0
 }
 
 ensure_podman_api_group() {
@@ -570,7 +603,10 @@ ensure_podman_api_group() {
 }
 
 configure_podman_api_proxy() {
-    ensure_podmin_podman_socket
+    if ! ensure_podmin_podman_socket; then
+        log_warn "Skipping Podman API proxy setup because podman.socket is unavailable."
+        return
+    fi
     ensure_podman_api_group
 
     local proxy_socket=/etc/systemd/system/podmin-podman.socket
@@ -1233,6 +1269,16 @@ switch_to_phase1_logging() {
     CURRENT_PHASE="phase1"
     LOG_FILE="${PHASE1_LOG}"
     export LOG_FILE
+    if [[ -z "${RUN_ID:-}" ]]; then
+        if [[ ! -s "${RUN_ID_FILE}" ]]; then
+            log_error "Resume requested but run id missing at ${RUN_ID_FILE}; run phase 0 first."
+            exit 1
+        fi
+        RUN_ID=$(cat "${RUN_ID_FILE}")
+        BACKUP_ROOT="${BACKUP_ROOT_BASE}/${RUN_ID}"
+        BACKUP_ARCHIVE="/root/archarden-backups-${RUN_ID}.tar.gz"
+        log_info "Loaded run id ${RUN_ID} for phase 1 resume"
+    fi
     log_info "==== Starting Phase 1 actions (logging to ${LOG_FILE}) ===="
 }
 
