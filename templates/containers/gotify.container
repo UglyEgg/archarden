@@ -7,7 +7,7 @@ Wants=network-online.target
 ContainerName=gotify
 Image=gotify/server:2.4.0
 Environment=TZ=UTC
-PublishPort=127.0.0.1:8090:80/tcp
+PublishPort=10.66.66.1:8090:80/tcp
 Volume=/var/lib/gotify/data:/app/data:Z
 ReadOnly=false
 User=1000:1000
