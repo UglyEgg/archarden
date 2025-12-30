@@ -1263,12 +1263,6 @@ ensure_lts_kernel_and_reboot_gate() {
 }
 
 switch_to_phase1_logging() {
-    if [[ "${CURRENT_PHASE}" == "phase1" ]]; then
-        return
-    fi
-    CURRENT_PHASE="phase1"
-    LOG_FILE="${PHASE1_LOG}"
-    export LOG_FILE
     if [[ -z "${RUN_ID:-}" ]]; then
         if [[ ! -s "${RUN_ID_FILE}" ]]; then
             log_error "Resume requested but run id missing at ${RUN_ID_FILE}; run phase 0 first."
@@ -1279,6 +1273,9 @@ switch_to_phase1_logging() {
         BACKUP_ARCHIVE="/root/archarden-backups-${RUN_ID}.tar.gz"
         log_info "Loaded run id ${RUN_ID} for phase 1 resume"
     fi
+    CURRENT_PHASE="phase1"
+    LOG_FILE="${PHASE1_LOG}"
+    export LOG_FILE
     log_info "==== Starting Phase 1 actions (logging to ${LOG_FILE}) ===="
 }
 
