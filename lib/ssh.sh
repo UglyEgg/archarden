@@ -2,11 +2,19 @@
 # Copyright (c) 2025 Richard Majewski
 
 configure_sshd() {
+    local hardening_tmp
     mkdir -p "${SSHD_CONFIG_DIR}"
     run_cmd "ssh-keygen -A"
     backup_file "${SSHD_HARDENING_DROPIN}"
     backup_file "${SSHD_CRYPTO_DROPIN}"
-    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/sshd_hardening.conf" | write_file_atomic "${SSHD_HARDENING_DROPIN}"
+    hardening_tmp=$(mktemp)
+    sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/sshd_hardening.conf" > "${hardening_tmp}"
+    if [[ ${KEEP_SSH_22} -eq 1 && "${SSH_PORT}" != "22" ]]; then
+        printf '\nPort 22\n' >> "${hardening_tmp}"
+        log_warn "Keeping SSH on legacy port 22 alongside ${SSH_PORT} (requested by --keep-ssh-22)."
+    fi
+    write_file_atomic "${SSHD_HARDENING_DROPIN}" < "${hardening_tmp}"
+    rm -f "${hardening_tmp}"
     write_file_atomic "${SSHD_CRYPTO_DROPIN}" < "${CONFIG_DIR}/sshd_crypto_hardening.conf"
     if [ "${DRY_RUN}" -eq 0 ]; then
         if ! sshd -t; then

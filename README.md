@@ -33,7 +33,7 @@ sudo ./harden --dry-run --skip-firewall-enable
 - `--pubkey-file <path>` / `--pubkey "<key>"`: (required) install SSH public key for the admin user.
 - `--ssh-port <port>`: set the SSH daemon port (default 2122).
 - `--restrict-ssh-cidr <CIDR>`: restrict SSH access in UFW.
-- `--keep-ssh-22`: keep port 22 open in UFW after migration.
+- `--keep-ssh-22`: keep port 22 listening and allowed in UFW alongside the hardened port.
 - `--enable-auditd`: install and enable auditd (optional).
 - `--disable-fail2ban`: skip fail2ban setup.
 - `--disable-firewall`: skip firewall configuration entirely (alias: `--disable-ufw`).
@@ -70,7 +70,7 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 - Optionally sets the system hostname with `hostnamectl` when `--hostname` is provided.
 - Reports enabled services for review.
 - Creates the SSH admin (`--user`) with membership in `ssh` and `wheel`, a locked password (key-only login), and passwordless sudo in `/etc/sudoers.d/90-archarden-ssh-user`.
-- Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf` and `/etc/ssh/sshd_config.d/10-crypto-hardening.conf`, limits logins to the dedicated `ssh` group, denies SSH for `podmin` (`DenyUsers podmin`), and moves the daemon to a configurable port (**default 2122**) with key-only auth. Validation uses `sshd -t`, the port is verified before firewall changes, and host keys are rotated with backups under `/root/ssh-hostkey-backup/<timestamp>/` (clients must accept the new keys).
+- Hardens SSH via `/etc/ssh/sshd_config.d/10-hardening.conf` and `/etc/ssh/sshd_config.d/10-crypto-hardening.conf`, limits logins to the dedicated `ssh` group, denies SSH for `podmin` (`DenyUsers podmin`), and moves the daemon to a configurable port (**default 2122**) with key-only auth (optionally keeping port 22 active with `--keep-ssh-22`). Validation uses `sshd -t`, the port is verified before firewall changes, and host keys are rotated with backups under `/root/ssh-hostkey-backup/<timestamp>/` (clients must accept the new keys).
 - Configures UFW (nftables backend via `iptables-nft`, default deny incoming, allows SSH on the chosen port, allows `config/firewall_allow.list` entries by default). Optional CIDR restriction for SSH and a transition rule for port 22.
 - Sets up fail2ban with UFW actions and sshd jail on the hardened SSH port.
 - Enforces Podman OCI runtime to `runc` (system containers.conf and `/home/podmin/.config/containers/containers.conf`) and installs/activates rootless quadlets under `/home/podmin/.config/containers/systemd/` for NPM and Gotify using `systemctl --user --machine=podmin@.host` with non-interactive fallbacks.
@@ -83,9 +83,9 @@ SSH access is restricted to the dedicated `ssh` system group (gid < 1000). The a
 
 ## Safe SSH migration
 
-1. Run `./harden` with your public key. Use `--ssh-port <port>` to pick a custom port (default 2122) and `--keep-ssh-22` for a transition period if desired.
+1. Run `./harden` with your public key. Use `--ssh-port <port>` to pick a custom port (default 2122) and `--keep-ssh-22` to keep port 22 working alongside the hardened port for a transition period if desired.
 2. The script writes the sshd drop-in, validates config, restarts sshd, and verifies the chosen port is listening **before** enabling UFW.
-3. UFW is only enabled after sshd passes validation; port 22 can remain open with `--keep-ssh-22`.
+3. UFW is only enabled after sshd passes validation; port 22 can remain open and reachable with `--keep-ssh-22`.
 4. Confirm you can log in on the hardened SSH port before closing existing sessions.
 
 ## Logging and resume flow
