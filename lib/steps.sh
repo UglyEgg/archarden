@@ -270,7 +270,7 @@ podmin_podman_info() {
     ensure_podmin_user_manager || return 1
     runtime_dir="/run/user/${PODMAN_UID}"
     err_file=$(mktemp)
-    output=$(HOME="${home_dir}" XDG_RUNTIME_DIR="${runtime_dir}" runuser -u "${PODMAN_USER}" -- env HOME="${home_dir}" XDG_RUNTIME_DIR="${runtime_dir}" podman info --format '{{.Host.OCIRuntime.Name}}' 2>"${err_file}")
+    output=$(runuser -u "${PODMAN_USER}" -- bash -c "cd \"${home_dir}\" && exec env HOME=\"${home_dir}\" XDG_RUNTIME_DIR=\"${runtime_dir}\" podman info --format '{{.Host.OCIRuntime.Name}}'" 2>"${err_file}")
     rc=$?
     err_msg=$(tr -d '\r' < "${err_file}")
     rm -f "${err_file}"
