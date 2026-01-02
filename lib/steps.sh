@@ -257,6 +257,7 @@ podmin_podman_info() {
     output=$(echo "${output}" | tr -d '\r')
     if [[ ${rc} -ne 0 ]]; then
         log_error "podman info failed for ${PODMAN_USER}: ${err_msg:-unknown error}"
+        PODMAN_PREREQ_REASON=${PODMAN_PREREQ_REASON:-"podman info failed: ${err_msg:-unknown error}"}
         return ${rc}
     fi
     echo "${output}"
@@ -264,10 +265,15 @@ podmin_podman_info() {
 
 ensure_rootless_podman_prereqs() {
     PODMAN_PREREQS_READY=1
-    ensure_subordinate_ids || PODMAN_PREREQS_READY=0
+    PODMAN_PREREQ_REASON=""
+    if ! ensure_subordinate_ids; then
+        PODMAN_PREREQS_READY=0
+        PODMAN_PREREQ_REASON=${PODMAN_PREREQ_REASON:-"failed to ensure subordinate ID ranges for ${PODMAN_USER}"}
+    fi
     ensure_userns_sysctl
     if ! ensure_podmin_user_manager; then
         PODMAN_PREREQS_READY=0
+        PODMAN_PREREQ_REASON=${PODMAN_PREREQ_REASON:-"user manager not available for ${PODMAN_USER} (no user bus)"}
         return 0
     fi
     if [[ ${PODMAN_PREREQS_READY} -eq 0 ]]; then
@@ -668,7 +674,7 @@ verify_quadlet_status() {
 configure_rootless_quadlets() {
     local systemd_dir
     if [[ ${PODMAN_PREREQS_READY} -eq 0 ]]; then
-        log_warn "Skipping rootless quadlet configuration because Podman prerequisites are not satisfied."
+        log_warn "Skipping rootless quadlet configuration because Podman prerequisites are not satisfied: ${PODMAN_PREREQ_REASON:-unknown}."
         return
     fi
     ensure_npm_quadlet
@@ -812,7 +818,7 @@ ensure_podman_api_group() {
 
 configure_podman_api_proxy() {
     if ! ensure_podmin_podman_socket; then
-        log_warn "Skipping Podman API proxy setup because podman.socket is unavailable."
+        log_warn "Skipping Podman API proxy setup because podman.socket is unavailable${PODMAN_PREREQ_REASON:+ (${PODMAN_PREREQ_REASON})}."
         return
     fi
     local podman_socket_path="/run/user/${PODMAN_UID}/podman/podman.sock"
