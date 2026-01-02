@@ -3,9 +3,8 @@
 # Copyright (c) 2025 Richard Majewski
 
 LOG_FILE="${LOG_FILE:-/var/log/vps-harden.log}"
-# shellcheck disable=SC2034
+# shellcheck disable=SC2034  # collected for reporting in steps
 BACKUP_PATHS=()
-# shellcheck enable=SC2034
 DRY_RUN=${DRY_RUN:-0}
 
 if [[ -t 1 ]]; then

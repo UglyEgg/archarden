@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Richard Majewski
 set -eEuo pipefail
 
-# shellcheck disable=SC2034
+# shellcheck disable=SC2034  # shared globals used across sourced libs and steps
 PHASE0_LOG="/var/log/vps-harden.phase0.log"
 PHASE1_LOG="/var/log/vps-harden.phase1.log"
 LOG_FILE="${PHASE0_LOG}"
@@ -83,7 +83,6 @@ WIREGUARD_SERVER_ALLOWED_IP=""
 PODMAN_API_GROUP="podman-api"
 ONLY_STEPS=()
 SKIP_STEPS=()
-# shellcheck enable=SC2034
 
 PHASE0_STEPS=(
     preflight
