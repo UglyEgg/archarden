@@ -275,7 +275,8 @@ ensure_rootless_podman_prereqs() {
     fi
     if ! podmin_podman_info >/dev/null; then
         PODMAN_PREREQS_READY=0
-        return 1
+        log_warn "Podman prerequisites not met; podman info failed for ${PODMAN_USER}."
+        return 0
     fi
 }
 
