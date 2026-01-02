@@ -135,6 +135,26 @@ configure_podman_runtime() {
     ensure_containers_runtime_config "${podmin_home}/.config/containers/containers.conf" "${PODMAN_USER}" "${PODMAN_USER}"
 }
 
+ensure_podmin_config_dir() {
+    local home dir
+    home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
+    if [[ -z "${home}" ]]; then
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            log_info "[DRY-RUN] Would ensure ${PODMAN_USER} home directory ownership"
+            return 0
+        fi
+        log_error "Unable to determine home for ${PODMAN_USER} when validating config directory ownership."
+        return 1
+    fi
+    dir="${home}/.config"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would ensure ${dir} exists and is owned by ${PODMAN_USER}:${PODMAN_USER}"
+        return 0
+    fi
+    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${dir}"
+    return 0
+}
+
 subordinate_id_max_end() {
     local file="$1" max_end=0 line name start count end
     [[ -f "${file}" ]] || { echo 0; return; }
@@ -269,6 +289,10 @@ ensure_rootless_podman_prereqs() {
     if ! ensure_subordinate_ids; then
         PODMAN_PREREQS_READY=0
         PODMAN_PREREQ_REASON=${PODMAN_PREREQ_REASON:-"failed to ensure subordinate ID ranges for ${PODMAN_USER}"}
+    fi
+    if ! ensure_podmin_config_dir; then
+        PODMAN_PREREQS_READY=0
+        PODMAN_PREREQ_REASON=${PODMAN_PREREQ_REASON:-"failed to ensure ${PODMAN_USER} config directory ownership"}
     fi
     ensure_userns_sysctl
     if ! ensure_podmin_user_manager; then
