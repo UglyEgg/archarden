@@ -8,7 +8,7 @@ ContainerName=gotify
 Image=gotify/server:2.4.0
 Environment=TZ=UTC
 PublishPort=10.66.66.1:8090:80/tcp
-Volume=/var/lib/gotify/data:/app/data:Z
+Volume=gotify-data:/app/data
 ReadOnly=false
 User=1000:1000
 DropCapability=all

@@ -302,23 +302,60 @@ quadlet::ensure_install_default_target() {
     rm -f "${tmp_out}"
 }
 
+quadlet::check_duplicate_publish_ports() {
+    local dest="$1"
+    local line value
+    declare -A seen=()
+    local -a publish_lines=() duplicates=()
+
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would check for duplicate PublishPort entries in ${dest}"
+        return
+    fi
+
+    if [[ ! -f "${dest}" ]]; then
+        log_warn "PublishPort check skipped; ${dest} not found"
+        return
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^PublishPort= ]]; then
+            value=${line#PublishPort=}
+            publish_lines+=("${value}")
+            if [[ -n "${seen[${value}]+x}" ]]; then
+                duplicates+=("${value}")
+            fi
+            seen["${value}"]=1
+        fi
+    done < "${dest}"
+
+    if [[ ${#duplicates[@]} -gt 0 ]]; then
+        log_error "Duplicate PublishPort entries detected in ${dest}: ${duplicates[*]}"
+        log_error "PublishPort lines:"
+        for value in "${publish_lines[@]}"; do
+            log_error "  ${value}"
+        done
+        exit 1
+    fi
+}
+
 quadlet::write_unit() {
     local target="$1" source_tmp="$2"
     write_file_atomic "${target}" < "${source_tmp}"
     ensure_file_permissions "${target}" 0644 "${PODMAN_USER}"
 }
 
-quadlet::enable() {
+quadlet::restart() {
     local user="$1" service="$2"
     if [[ "${user}" == "${PODMAN_USER}" ]]; then
-        if ! podmin_systemctl start "${service}"; then
-            log_warn "Failed to start ${service} for ${user}; rootless services may not be active"
+        if ! podmin_systemctl restart "${service}"; then
+            log_warn "Failed to restart ${service} for ${user}; rootless services may not be active"
             return
         fi
         verify_quadlet_status "${service}"
         return
     fi
-    run_cmd "runuser -u ${user} -- systemctl --user start ${service}"
+    run_cmd "runuser -u ${user} -- systemctl --user restart ${service}"
 }
 
 ensure_npm_quadlet() {
@@ -329,39 +366,26 @@ ensure_npm_quadlet() {
 
     tmp_out=$(mktemp)
     local in_container=0
-    local -a required_ports=("127.0.0.1:8181:81" "127.0.0.1:8080:80" "127.0.0.1:8443:443")
-    declare -A port_seen=()
-    for port in "${required_ports[@]}"; do
-        port_seen["${port}"]=0
-    done
+    local -a canonical_ports=(
+        "127.0.0.1:8080:80/tcp"
+        "127.0.0.1:8443:443/tcp"
+        "127.0.0.1:8181:81/tcp"
+    )
+    local wrote_ports=0
 
     while IFS= read -r line || [[ -n "${line}" ]]; do
         if [[ "${line}" =~ ^\[.*\] ]]; then
             if [[ ${in_container} -eq 1 ]]; then
-                for port in "${required_ports[@]}"; do
-                    if [[ ${port_seen[${port}]} -eq 0 ]]; then
-                        echo "PublishPort=${port}" >>"${tmp_out}"
-                        port_seen["${port}"]=1
-                    fi
-                done
+                if [[ ${wrote_ports} -eq 0 ]]; then
+                    printf 'PublishPort=%s\n' "${canonical_ports[@]}" >>"${tmp_out}"
+                    wrote_ports=1
+                fi
             fi
             in_container=0
         fi
 
         if [[ ${in_container} -eq 1 ]]; then
             if [[ "${line}" =~ ^PublishPort= ]]; then
-                local port_value
-                port_value=${line#PublishPort=}
-                if [[ "${port_value}" == "80:80" || "${port_value}" == "443:443" ]]; then
-                    continue
-                fi
-                if [[ -n "${port_seen[${port_value}]+x}" ]]; then
-                    if [[ ${port_seen[${port_value}]} -eq 1 ]]; then
-                        continue
-                    fi
-                    port_seen["${port_value}"]=1
-                fi
-                echo "PublishPort=${port_value}" >>"${tmp_out}"
                 continue
             fi
 
@@ -376,18 +400,14 @@ ensure_npm_quadlet() {
 
         if [[ "${line}" == "[Container]" ]]; then
             in_container=1
-            for port in "${required_ports[@]}"; do
-                port_seen["${port}"]=0
-            done
+            wrote_ports=0
         fi
     done < "${tmp_in}"
 
     if [[ ${in_container} -eq 1 ]]; then
-        for port in "${required_ports[@]}"; do
-            if [[ ${port_seen[${port}]} -eq 0 ]]; then
-                echo "PublishPort=${port}" >>"${tmp_out}"
-            fi
-        done
+        if [[ ${wrote_ports} -eq 0 ]]; then
+            printf 'PublishPort=%s\n' "${canonical_ports[@]}" >>"${tmp_out}"
+        fi
     fi
 
     quadlet::write_unit "${target}" "${tmp_out}"
@@ -498,9 +518,12 @@ verify_quadlet_status() {
 }
 
 configure_rootless_quadlets() {
+    local systemd_dir
     ensure_npm_quadlet
     ensure_gotify_quadlet
     ensure_uptime_kuma_quadlet
+    systemd_dir=$(quadlet::systemd_dir)
+    quadlet::check_duplicate_publish_ports "${systemd_dir}/nginx-proxy-manager.container"
     if ! ensure_quadlet_generator; then
         return
     fi
@@ -508,9 +531,12 @@ configure_rootless_quadlets() {
     if ! podmin_systemctl daemon-reload; then
         log_warn "Failed to reload user systemd daemon for ${PODMAN_USER}; rootless services may not be active"
     fi
-    quadlet::enable "${PODMAN_USER}" "nginx-proxy-manager.service"
-    quadlet::enable "${PODMAN_USER}" "gotify.service"
-    quadlet::enable "${PODMAN_USER}" "uptime-kuma.service"
+    quadlet::restart "${PODMAN_USER}" "nginx-proxy-manager.service"
+    quadlet::restart "${PODMAN_USER}" "gotify.service"
+    quadlet::restart "${PODMAN_USER}" "uptime-kuma.service"
+    run_status_capture "nginx-proxy-manager status" podmin_systemctl status nginx-proxy-manager.service --no-pager
+    run_status_capture "gotify status" podmin_systemctl status gotify.service --no-pager
+    run_status_capture "uptime-kuma status" podmin_systemctl status uptime-kuma.service --no-pager
 }
 
 configure_socket_proxyd() {
@@ -565,6 +591,7 @@ EOT
 }
 
 ensure_podmin_podman_socket() {
+    ensure_podmin_user_manager
     local -a podman_socket_units=(
         /usr/lib/systemd/user/podman.socket
         /etc/systemd/user/podman.socket
@@ -582,7 +609,6 @@ ensure_podmin_podman_socket() {
         return 1
     fi
 
-    ensure_podmin_user_manager
     if ! podmin_systemctl enable --now podman.socket; then
         log_warn "Could not enable podman.socket for ${PODMAN_USER}; Podman API proxy will be skipped."
         return 1
@@ -636,6 +662,8 @@ EOT
 Description=Proxy to ${PODMAN_USER} Podman API
 Requires=podmin-podman.socket
 After=podmin-podman.socket
+Requires=user@${PODMAN_UID}.service
+After=user@${PODMAN_UID}.service
 
 [Service]
 ExecStart=/usr/lib/systemd/systemd-socket-proxyd ${podman_socket}
@@ -649,6 +677,11 @@ EOT
 
     run_cmd "systemctl daemon-reload"
     run_cmd "systemctl enable --now podmin-podman.socket"
+    run_status_capture "podman.socket (podmin)" podmin_systemctl status podman.socket --no-pager
+    run_status_capture "podman API proxy socket" bash -c "ss -xl | grep podmin-podman.sock || true"
+    if command -v podman >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && [[ -n "${USER_NAME}" ]]; then
+        run_status_capture "podman --remote info (as ${USER_NAME})" bash -c "sudo -u ${USER_NAME} podman --remote --url unix:///run/podmin-podman.sock info || true"
+    fi
 }
 
 gotify::ensure_container_running() {

@@ -5,7 +5,7 @@ set -euo pipefail
 
 image="gotify/server:2.4.0"
 name="gotify"
-host_data="/var/lib/gotify/data"
+data_volume="gotify-data"
 host_port="8090"
 
 if ! command -v podman >/dev/null 2>&1; then
@@ -13,13 +13,12 @@ if ! command -v podman >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "${host_data}"
 podman run -d \
   --name "${name}" \
   --replace \
   --tz=UTC \
   -p "127.0.0.1:${host_port}:80/tcp" \
-  -v "${host_data}:/app/data:Z" \
+  -v "${data_volume}:/app/data" \
   --health-cmd "wget -q --spider http://127.0.0.1:80/health || exit 1" \
   --health-interval 30s \
   --health-retries 5 \
