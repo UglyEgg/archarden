@@ -5,9 +5,9 @@ After=network.target
 [Container]
 Image=docker.io/jc21/nginx-proxy-manager:latest
 Network=slirp4netns
-PublishPort=10.66.66.1:8181:81
-PublishPort=127.0.0.1:8080:80
-PublishPort=127.0.0.1:8443:443
+PublishPort=127.0.0.1:8080:80/tcp
+PublishPort=127.0.0.1:8443:443/tcp
+PublishPort=127.0.0.1:8181:81/tcp
 Volume=npm-data:/data
 Volume=npm-letsencrypt:/etc/letsencrypt
 Memory=512M
