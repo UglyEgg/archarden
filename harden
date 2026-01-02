@@ -49,6 +49,7 @@ PODMAN_USER="podmin"
 PODMAN_HOME=""
 PODMAN_UID=""
 ENSURED_PODMIN_MANAGER=0
+PODMAN_PREREQS_READY=1
 PUBKEY_FILE=""
 PUBKEY_VALUE=""
 ENABLE_AUDITD=0
@@ -70,7 +71,7 @@ RUN_ID=""
 BACKUP_ROOT=""
 BACKUP_ARCHIVE=""
 README_MARKER="<!-- managed: archarden -->"
-GOTIFY_PORT=8090
+GOTIFY_PORT=9090
 WG_INTERFACE_ADDRESS=""
 WG_LISTEN_PORT=""
 WG_DNS=""
@@ -108,6 +109,7 @@ PHASE1_STEPS=(
     create_admin_user
     ensure_podmin_user
     configure_podman_runtime
+    ensure_rootless_podman_prereqs
     configure_sshd
     restart_sshd_and_verify
     rotate_sshd_host_keys

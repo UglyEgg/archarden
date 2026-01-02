@@ -135,6 +135,150 @@ configure_podman_runtime() {
     ensure_containers_runtime_config "${podmin_home}/.config/containers/containers.conf" "${PODMAN_USER}" "${PODMAN_USER}"
 }
 
+subordinate_id_max_end() {
+    local file="$1" max_end=0 line name start count end
+    [[ -f "${file}" ]] || { echo 0; return; }
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" || "${line}" =~ ^# ]] && continue
+        IFS=':' read -r name start count <<<"${line}"
+        [[ -z "${name}" || -z "${start}" || -z "${count}" ]] && continue
+        if [[ "${start}" =~ ^[0-9]+$ && "${count}" =~ ^[0-9]+$ ]]; then
+            end=$((start + count - 1))
+            if (( end > max_end )); then
+                max_end=${end}
+            fi
+        fi
+    done < "${file}"
+    echo "${max_end}"
+}
+
+ensure_subordinate_ids() {
+    local range_size=65536 user="${PODMAN_USER}"
+    local subuid_file=/etc/subuid subgid_file=/etc/subgid
+    local existing_start="" existing_size="" existing_start_gid="" existing_size_gid=""
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would ensure subordinate ID ranges for ${user} in ${subuid_file} and ${subgid_file}"
+        return 0
+    fi
+
+    if [[ -f "${subuid_file}" ]]; then
+        if grep -q "^${user}:" "${subuid_file}" 2>/dev/null; then
+            IFS=':' read -r _ existing_start existing_size < <(grep "^${user}:" "${subuid_file}" | head -n1)
+        fi
+    fi
+    if [[ -f "${subgid_file}" ]]; then
+        if grep -q "^${user}:" "${subgid_file}" 2>/dev/null; then
+            IFS=':' read -r _ existing_start_gid existing_size_gid < <(grep "^${user}:" "${subgid_file}" | head -n1)
+        fi
+    fi
+
+    if [[ -n "${existing_start}" && -n "${existing_start_gid}" ]]; then
+        return 0
+    fi
+
+    local max_end_subuid max_end_subgid max_end start_range end_range start_to_use size_to_use
+    max_end_subuid=$(subordinate_id_max_end "${subuid_file}")
+    max_end_subgid=$(subordinate_id_max_end "${subgid_file}")
+    max_end=${max_end_subuid}
+    if (( max_end_subgid > max_end )); then
+        max_end=${max_end_subgid}
+    fi
+
+    start_to_use="${existing_start:-${existing_start_gid}}"
+    size_to_use="${existing_size:-${existing_size_gid:-${range_size}}}"
+    if [[ -z "${start_to_use}" ]]; then
+        start_to_use=$(( ((max_end + 1 + range_size - 1) / range_size) * range_size ))
+        size_to_use=${range_size}
+    fi
+    start_range=${start_to_use}
+    end_range=$((start_range + size_to_use - 1))
+
+    if [[ ! -f "${subuid_file}" ]]; then
+        run_cmd "install -m 0644 /dev/null ${subuid_file}"
+    fi
+    if [[ ! -f "${subgid_file}" ]]; then
+        run_cmd "install -m 0644 /dev/null ${subgid_file}"
+    fi
+
+    if ! grep -q "^${user}:" "${subuid_file}" 2>/dev/null; then
+        run_cmd "bash -c 'echo \"${user}:${start_range}:${size_to_use}\" >> ${subuid_file}'"
+        log_info "Added subordinate UID range for ${user}: ${start_range}-${end_range}"
+    fi
+    if ! grep -q "^${user}:" "${subgid_file}" 2>/dev/null; then
+        run_cmd "bash -c 'echo \"${user}:${start_range}:${size_to_use}\" >> ${subgid_file}'"
+        log_info "Added subordinate GID range for ${user}: ${start_range}-${end_range}"
+    fi
+}
+
+ensure_userns_sysctl() {
+    local sysctl_file=/etc/sysctl.d/99-userns.conf
+    local -a lines=()
+    local value
+
+    if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
+        value=$(cat /proc/sys/kernel/unprivileged_userns_clone)
+        if [[ "${value}" == "0" ]]; then
+            lines+=("kernel.unprivileged_userns_clone=1")
+        fi
+    fi
+    if [[ -f /proc/sys/user/max_user_namespaces ]]; then
+        value=$(cat /proc/sys/user/max_user_namespaces)
+        if [[ "${value}" == "0" ]]; then
+            lines+=("user.max_user_namespaces=15000")
+        fi
+    fi
+
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        return
+    fi
+
+    run_cmd "install -d -m 0755 /etc/sysctl.d"
+    write_file_atomic "${sysctl_file}" <<EOT
+$(printf '%s\n' "${lines[@]}")
+EOT
+    run_status_capture "sysctl --system" sysctl --system
+}
+
+podmin_podman_info() {
+    local runtime_dir err_file output rc=0 err_msg home_dir
+    home_dir="${PODMAN_HOME:-$(eval echo "~${PODMAN_USER}")}"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would run podman info as ${PODMAN_USER}"
+        echo "runc"
+        return 0
+    fi
+    ensure_podmin_user_manager || return 1
+    runtime_dir="/run/user/${PODMAN_UID}"
+    err_file=$(mktemp)
+    output=$(HOME="${home_dir}" XDG_RUNTIME_DIR="${runtime_dir}" runuser -u "${PODMAN_USER}" -- env HOME="${home_dir}" XDG_RUNTIME_DIR="${runtime_dir}" podman info --format '{{.Host.OCIRuntime.Name}}' 2>"${err_file}")
+    rc=$?
+    err_msg=$(tr -d '\r' < "${err_file}")
+    rm -f "${err_file}"
+    output=$(echo "${output}" | tr -d '\r')
+    if [[ ${rc} -ne 0 ]]; then
+        log_error "podman info failed for ${PODMAN_USER}: ${err_msg:-unknown error}"
+        return ${rc}
+    fi
+    echo "${output}"
+}
+
+ensure_rootless_podman_prereqs() {
+    PODMAN_PREREQS_READY=1
+    ensure_subordinate_ids || PODMAN_PREREQS_READY=0
+    ensure_userns_sysctl
+    if ! ensure_podmin_user_manager; then
+        PODMAN_PREREQS_READY=0
+        return 0
+    fi
+    if [[ ${PODMAN_PREREQS_READY} -eq 0 ]]; then
+        return 0
+    fi
+    if ! podmin_podman_info >/dev/null; then
+        PODMAN_PREREQS_READY=0
+        return 1
+    fi
+}
+
 ensure_quadlet_generator() {
     local generator_dir generator_path
     generator_dir=$(systemd-path user-generators 2>/dev/null || true)
@@ -508,7 +652,10 @@ ensure_uptime_kuma_quadlet() {
 
 verify_quadlet_status() {
     local service="$1"
-    ensure_podmin_user_manager
+    if ! ensure_podmin_user_manager; then
+        log_warn "User manager unavailable for ${PODMAN_USER}; skipping quadlet management."
+        return
+    fi
     if podmin_systemctl status "${service}" --no-pager; then
         return 0
     fi
@@ -519,6 +666,10 @@ verify_quadlet_status() {
 
 configure_rootless_quadlets() {
     local systemd_dir
+    if [[ ${PODMAN_PREREQS_READY} -eq 0 ]]; then
+        log_warn "Skipping rootless quadlet configuration because Podman prerequisites are not satisfied."
+        return
+    fi
     ensure_npm_quadlet
     ensure_gotify_quadlet
     ensure_uptime_kuma_quadlet
@@ -530,13 +681,26 @@ configure_rootless_quadlets() {
     ensure_podmin_user_manager
     if ! podmin_systemctl daemon-reload; then
         log_warn "Failed to reload user systemd daemon for ${PODMAN_USER}; rootless services may not be active"
+        return
     fi
-    quadlet::restart "${PODMAN_USER}" "nginx-proxy-manager.service"
-    quadlet::restart "${PODMAN_USER}" "gotify.service"
-    quadlet::restart "${PODMAN_USER}" "uptime-kuma.service"
-    run_status_capture "nginx-proxy-manager status" podmin_systemctl status nginx-proxy-manager.service --no-pager
-    run_status_capture "gotify status" podmin_systemctl status gotify.service --no-pager
-    run_status_capture "uptime-kuma status" podmin_systemctl status uptime-kuma.service --no-pager
+    podmin_systemctl reset-failed || true
+    podmin_systemctl daemon-reload || true
+
+    local services=(
+        nginx-proxy-manager.service
+        gotify.service
+        uptime-kuma.service
+    )
+    local service
+    for service in "${services[@]}"; do
+        if podmin_systemctl start "${service}"; then
+            run_status_capture "${service} status" podmin_systemctl status "${service}" --no-pager
+        else
+            log_warn "Failed to start ${service}; collecting diagnostics."
+            run_status_capture "${service} status" systemctl --user --machine="${PODMAN_USER}@.host" status "${service}" --no-pager || true
+            run_status_capture "${service} journal" journalctl --user --machine="${PODMAN_USER}@.host" -u "${service}" -n 200 --no-pager || true
+        fi
+    done
 }
 
 configure_socket_proxyd() {
@@ -591,26 +755,43 @@ EOT
 }
 
 ensure_podmin_podman_socket() {
-    ensure_podmin_user_manager
-    local -a podman_socket_units=(
-        /usr/lib/systemd/user/podman.socket
-        /etc/systemd/user/podman.socket
-    )
-    local have_socket_unit=0
-    local unit
-    for unit in "${podman_socket_units[@]}"; do
-        if [[ -f "${unit}" ]]; then
-            have_socket_unit=1
-            break
-        fi
-    done
-    if [[ ${have_socket_unit} -eq 0 ]]; then
-        log_warn "podman.socket unit missing; install podman with systemd user units to enable API proxy."
+    local systemd_dir runtime_dir socket_path home_dir
+    if [[ ${PODMAN_PREREQS_READY} -eq 0 ]]; then
+        log_warn "Skipping podman.socket setup because Podman prerequisites are not satisfied."
         return 1
     fi
+    ensure_podmin_user_manager || return 1
+    home_dir="${PODMAN_HOME:-$(eval echo \"~${PODMAN_USER}\")}"
+    runtime_dir="/run/user/${PODMAN_UID}"
+    socket_path="${runtime_dir}/podman/podman.sock"
 
+    if ! podmin_systemctl cat podman.socket >/dev/null 2>&1; then
+        systemd_dir="${home_dir}/.config/systemd/user"
+        run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${systemd_dir}"
+        write_file_atomic "${systemd_dir}/podman.socket" <<'EOT'
+[Socket]
+ListenStream=%t/podman/podman.sock
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
+EOT
+        write_file_atomic "${systemd_dir}/podman.service" <<'EOT'
+[Service]
+ExecStart=/usr/bin/podman system service --time=0 unix://%t/podman/podman.sock
+KillMode=process
+EOT
+        ensure_file_permissions "${systemd_dir}/podman.socket" 0644 "${PODMAN_USER}"
+        ensure_file_permissions "${systemd_dir}/podman.service" 0644 "${PODMAN_USER}"
+    fi
+
+    podmin_systemctl daemon-reload || true
     if ! podmin_systemctl enable --now podman.socket; then
         log_warn "Could not enable podman.socket for ${PODMAN_USER}; Podman API proxy will be skipped."
+        return 1
+    fi
+    if [[ ! -S "${socket_path}" ]]; then
+        log_warn "Podman socket not found at ${socket_path} after enabling podman.socket"
         return 1
     fi
     return 0
@@ -631,6 +812,11 @@ ensure_podman_api_group() {
 configure_podman_api_proxy() {
     if ! ensure_podmin_podman_socket; then
         log_warn "Skipping Podman API proxy setup because podman.socket is unavailable."
+        return
+    fi
+    local podman_socket_path="/run/user/${PODMAN_UID}/podman/podman.sock"
+    if [[ ! -S "${podman_socket_path}" ]]; then
+        log_warn "Skipping Podman API proxy setup; expected socket missing at ${podman_socket_path}"
         return
     fi
     ensure_podman_api_group
@@ -1322,7 +1508,9 @@ run_as_user() {
         log_info "[DRY-RUN] (as ${user}) ${cmd}"
         return 0
     fi
-    run_cmd "install -d -m 0700 -o ${user} -g ${user} ${runtime_dir}"
+    if [[ ! -d "${runtime_dir}" ]]; then
+        log_warn "Runtime directory ${runtime_dir} missing for ${user}; ensure logind is managing the session."
+    fi
     log_info "Running as ${user}: ${cmd}"
     set +e
     HOME=$(eval echo "~${user}") XDG_RUNTIME_DIR="${runtime_dir}" runuser -l "${user}" -c "${cmd}"
@@ -1349,13 +1537,18 @@ ensure_podmin_user_manager() {
     if ! loginctl enable-linger "${PODMAN_USER}" >/dev/null 2>&1; then
         log_warn "Could not enable linger for ${PODMAN_USER}; rootless services may not persist across reboots"
     fi
-    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${runtime_dir}"
     err_file=$(mktemp)
     if ! systemctl start "user@${PODMAN_UID}.service" >/dev/null 2>"${err_file}"; then
         err_msg=$(tr -d '\r' < "${err_file}" | head -n1)
         if [[ -n "${err_msg}" ]]; then
             log_warn "Could not start user@${PODMAN_UID}.service for ${PODMAN_USER}: ${err_msg}"
         fi
+    fi
+    if [[ ! -S "${runtime_dir}/bus" ]]; then
+        log_error "DBus session bus missing at ${runtime_dir}/bus for ${PODMAN_USER}; logind must manage the user session. Skipping Podman setup."
+        PODMAN_PREREQS_READY=0
+        rm -f "${err_file}"
+        return 1
     fi
     rm -f "${err_file}"
     ENSURED_PODMIN_MANAGER=1
@@ -1753,18 +1946,24 @@ record_pending_args() {
 }
 
 verify_podman_runtime() {
-    local uid runtime_dir runtime_output
+    local runtime_output rc=0
     if [[ ${DRY_RUN} -eq 1 ]]; then
         log_info "[DRY-RUN] Would verify Podman runtime as ${PODMAN_USER}"
         return
     fi
-    uid=$(id -u "${PODMAN_USER}")
-    runtime_dir="/run/user/${uid}"
-    run_cmd "install -d -m 0700 -o ${PODMAN_USER} -g ${PODMAN_USER} ${runtime_dir}"
-    runtime_output=$(HOME="${PODMAN_HOME:-$(eval echo \"~${PODMAN_USER}\")}" XDG_RUNTIME_DIR="${runtime_dir}" runuser -u "${PODMAN_USER}" -- podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)
-    runtime_output=$(echo "${runtime_output}" | tr -d '\r')
+    if [[ ${PODMAN_PREREQS_READY} -eq 0 ]]; then
+        log_warn "Skipping Podman runtime verification because prerequisites were not satisfied."
+        return
+    fi
+    runtime_output=$(podmin_podman_info) || rc=$?
+    rc=${rc:-0}
+    runtime_output=$(echo "${runtime_output:-}" | tr -d '\r')
+    if [[ ${rc} -ne 0 || -z "${runtime_output}" ]]; then
+        log_warn "Podman runtime check failed for ${PODMAN_USER}; see earlier errors."
+        return
+    fi
     if [[ "${runtime_output}" != "runc" ]]; then
-        log_warn "Podman runtime reported '${runtime_output:-<empty>}' for ${PODMAN_USER}; expected 'runc'. Ensure containers.conf is applied."
+        log_warn "Podman runtime reported '${runtime_output}' for ${PODMAN_USER}; expected 'runc'. Ensure containers.conf is applied."
     else
         log_info "Podman runtime verified as '${runtime_output}' for ${PODMAN_USER}"
     fi
@@ -1795,6 +1994,10 @@ final_container_checks() {
     log_info "==== FINAL CONTAINER AND PORT CHECK ===="
     if [[ ${DRY_RUN} -eq 1 ]]; then
         log_info "[DRY-RUN] Would verify podmin containers and admin ports"
+        return
+    fi
+    if [[ ${PODMAN_PREREQS_READY} -eq 0 ]]; then
+        log_warn "Skipping container checks because Podman prerequisites were not satisfied."
         return
     fi
     if command -v runuser >/dev/null 2>&1 && command -v podman >/dev/null 2>&1; then
