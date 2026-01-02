@@ -1,8 +1,11 @@
+#!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2025 Richard Majewski
 
 LOG_FILE="${LOG_FILE:-/var/log/vps-harden.log}"
+# shellcheck disable=SC2034
 BACKUP_PATHS=()
+# shellcheck enable=SC2034
 DRY_RUN=${DRY_RUN:-0}
 
 if [[ -t 1 ]]; then
