@@ -3,6 +3,7 @@
 # Copyright (c) 2025 Richard Majewski
 set -eEuo pipefail
 
+# shellcheck disable=SC2034  # shared globals used across sourced libs and steps
 PHASE0_LOG="/var/log/vps-harden.phase0.log"
 PHASE1_LOG="/var/log/vps-harden.phase1.log"
 LOG_FILE="${PHASE0_LOG}"
@@ -28,12 +29,12 @@ if [[ ! -f "${SCRIPT_DIR}/lib/loader.sh" ]]; then
 fi
 CONFIG_DIR="${SCRIPT_DIR}/config"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
-# shellcheck source=lib/loader.sh
+# shellcheck source=lib/loader.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/loader.sh"
 source_libs
-# shellcheck source=lib/runner.sh
+# shellcheck source=lib/runner.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/runner.sh"
-# shellcheck source=lib/steps.sh
+# shellcheck source=lib/steps.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/steps.sh"
 
 DRY_RUN=0
@@ -202,7 +203,7 @@ parse_step_filters() {
     IFS=',' read -r -a target <<<"${value}"
     local idx
     for idx in "${!target[@]}"; do
-        target[${idx}]="${target[${idx}]//[[:space:]]/}"
+        target[idx]="${target[idx]//[[:space:]]/}"
     done
 }
 
