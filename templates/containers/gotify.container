@@ -5,17 +5,11 @@ Wants=network-online.target
 
 [Container]
 ContainerName=gotify
-Image=gotify/server:2.4.0
+Image=docker.io/gotify/server:2.5.0
 Environment=TZ=UTC
-PublishPort=10.66.66.1:8090:80/tcp
+PublishPort=127.0.0.1:9090:80
 Volume=gotify-data:/app/data
-ReadOnly=false
-User=1000:1000
-DropCapability=all
-SeccompProfile=default
-NotifyAccess=all
-Network=bridge
-PodmanArgs=--health-cmd "wget -q --spider http://127.0.0.1:80/health || exit 1" --health-interval 30s --health-retries 5 --health-start-period 20s --health-timeout 5s
+PodmanArgs=--pull=never --read-only=false --pids-limit=256 --memory=256m
 Memory=128M
 PidsLimit=256
 
