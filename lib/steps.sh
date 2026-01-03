@@ -728,8 +728,8 @@ configure_rootless_quadlets() {
             run_status_capture "${service} status" podmin_systemctl status "${service}" --no-pager
         else
             log_warn "Failed to start ${service}; collecting diagnostics."
-            run_status_capture "${service} status" systemctl --user --machine="${PODMAN_USER}@.host" status "${service}" --no-pager || true
-            run_status_capture "${service} journal" journalctl --user --machine="${PODMAN_USER}@.host" -u "${service}" -n 200 --no-pager || true
+            run_status_capture "${service} status" podmin_systemctl status "${service}" --no-pager || true
+            run_status_capture "${service} journal" runuser -u "${PODMAN_USER}" -- env XDG_RUNTIME_DIR="/run/user/${PODMAN_UID}" HOME="${PODMAN_HOME:-$(eval echo \"~${PODMAN_USER}\")}" journalctl --user -u "${service}" -n 200 --no-pager || true
         fi
     done
 }
@@ -2032,7 +2032,7 @@ final_container_checks() {
         return
     fi
     if command -v runuser >/dev/null 2>&1 && command -v podman >/dev/null 2>&1; then
-        run_status_capture "podman ps (as ${PODMAN_USER})" runuser -u "${PODMAN_USER}" -- podman ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
+        run_status_capture "podman ps (as ${PODMAN_USER})" runuser -u "${PODMAN_USER}" -- bash -lc "cd \"${PODMAN_HOME:-$(eval echo \"~${PODMAN_USER}\")}\" && podman ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'"
     else
         log_warn "podman or runuser not available; skipping podman ps check"
     fi
