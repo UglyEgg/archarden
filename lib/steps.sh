@@ -318,7 +318,6 @@ ensure_quadlet_generator() {
     fi
     local -a generator_candidates=(
         "${generator_dir%/}/podman-user-generator"
-        "/usr/lib/systemd/system-generators/podman-system-generator"
     )
 
     if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -332,8 +331,8 @@ ensure_quadlet_generator() {
         fi
     done
 
-    log_warn "Podman quadlet generator not found; checked: ${generator_candidates[*]}"
-    log_warn "Install podman with quadlet support (podman-quadlet or podman package including quadlet) and rerun the hardener"
+    log_warn "Podman user quadlet generator not found; checked: ${generator_candidates[*]}"
+    log_warn "Install podman with quadlet user generator support and rerun the hardener"
     return 1
 }
 
