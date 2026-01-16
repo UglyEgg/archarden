@@ -736,19 +736,19 @@ configure_rootless_quadlets() {
         gotify.service
         uptime-kuma.service
     )
-    local service container_unit container_path
+    local service container_file container_path
     for service in "${services[@]}"; do
-        container_unit="${service%.service}.container"
-        container_path="${systemd_dir}/${container_unit}"
+        container_file="${service%.service}.container"
+        container_path="${systemd_dir}/${container_file}"
         if [[ ! -f "${container_path}" ]]; then
-            log_warn "Unit ${container_unit} not found under ${systemd_dir}; cannot start ${service}"
+            log_warn "Unit ${container_file} not found under ${systemd_dir}; cannot start ${service}"
             run_cmd "ls -la ${systemd_dir} | grep -E 'nginx-proxy-manager|gotify|uptime-kuma' || true"
             continue
         fi
-        if podmin_systemctl enable --now "${container_unit}"; then
+        if podmin_systemctl enable --now "${service}"; then
             run_status_capture "${service} status" podmin_systemctl status "${service}" --no-pager
         else
-            log_warn "Failed to enable/start ${container_unit}; collecting diagnostics."
+            log_warn "Failed to enable/start ${service}; collecting diagnostics."
             run_status_capture "${service} status" podmin_systemctl status "${service}" --no-pager || true
             run_status_capture "${service} journal" runuser -u "${PODMAN_USER}" -- env XDG_RUNTIME_DIR="/run/user/${PODMAN_UID}" HOME="${PODMAN_HOME:-$(eval echo \"~${PODMAN_USER}\")}" journalctl --user -u "${service}" -n 200 --no-pager || true
         fi
