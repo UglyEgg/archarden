@@ -318,7 +318,6 @@ ensure_quadlet_generator() {
     fi
     local -a generator_candidates=(
         "${generator_dir%/}/podman-user-generator"
-        "/usr/lib/systemd/system-generators/podman-system-generator"
     )
 
     if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -332,8 +331,8 @@ ensure_quadlet_generator() {
         fi
     done
 
-    log_warn "Podman quadlet generator not found; checked: ${generator_candidates[*]}"
-    log_warn "Install podman with quadlet support (podman-quadlet or podman package including quadlet) and rerun the hardener"
+    log_warn "Podman user quadlet generator not found; checked: ${generator_candidates[*]}"
+    log_warn "Install podman with quadlet user generator support and rerun the hardener"
     return 1
 }
 
@@ -604,10 +603,25 @@ ensure_gotify_quadlet() {
 }
 
 ensure_uptime_kuma_quadlet() {
-    local systemd_dir target tmp_out tmp_in
+    local systemd_dir target tmp_out tmp_in podmin_home data_dir
     systemd_dir=$(quadlet::systemd_dir)
     target="${systemd_dir}/uptime-kuma.container"
     tmp_in=$(quadlet::render "${TEMPLATES_DIR}/containers/uptime-kuma.container" "${target}")
+    podmin_home="${PODMAN_HOME:-$(getent passwd "${PODMAN_USER}" | cut -d: -f6)}"
+    if [[ -z "${podmin_home}" ]]; then
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            podmin_home="/home/${PODMAN_USER}"
+        else
+            log_error "Unable to determine home for ${PODMAN_USER} when preparing uptime-kuma data dir."
+            exit 1
+        fi
+    fi
+    data_dir="${podmin_home}/.local/share/uptime-kuma"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would ensure uptime-kuma data dir at ${data_dir}"
+    else
+        run_cmd "install -d -m 0750 -o ${PODMAN_USER} -g ${PODMAN_USER} ${data_dir}"
+    fi
 
     tmp_out=$(mktemp)
     local in_container=0 saw_publish=0 saw_volume=0 saw_autoupdate=0 saw_image=0
@@ -722,12 +736,19 @@ configure_rootless_quadlets() {
         gotify.service
         uptime-kuma.service
     )
-    local service
+    local service container_unit container_path
     for service in "${services[@]}"; do
-        if podmin_systemctl start "${service}"; then
+        container_unit="${service%.service}.container"
+        container_path="${systemd_dir}/${container_unit}"
+        if [[ ! -f "${container_path}" ]]; then
+            log_warn "Unit ${container_unit} not found under ${systemd_dir}; cannot start ${service}"
+            run_cmd "ls -la ${systemd_dir} | grep -E 'nginx-proxy-manager|gotify|uptime-kuma' || true"
+            continue
+        fi
+        if podmin_systemctl enable --now "${container_unit}"; then
             run_status_capture "${service} status" podmin_systemctl status "${service}" --no-pager
         else
-            log_warn "Failed to start ${service}; collecting diagnostics."
+            log_warn "Failed to enable/start ${container_unit}; collecting diagnostics."
             run_status_capture "${service} status" podmin_systemctl status "${service}" --no-pager || true
             run_status_capture "${service} journal" runuser -u "${PODMAN_USER}" -- env XDG_RUNTIME_DIR="/run/user/${PODMAN_UID}" HOME="${PODMAN_HOME:-$(eval echo \"~${PODMAN_USER}\")}" journalctl --user -u "${service}" -n 200 --no-pager || true
         fi
