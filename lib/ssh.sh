@@ -7,6 +7,7 @@ configure_sshd() {
     run_cmd "ssh-keygen -A"
     backup_file "${SSHD_HARDENING_DROPIN}"
     backup_file "${SSHD_CRYPTO_DROPIN}"
+    backup_file "${SSHD_PORT_FORWARDING_DROPIN}"
     hardening_tmp=$(mktemp)
     sed "s/__SSH_PORT__/${SSH_PORT}/g" "${CONFIG_DIR}/sshd_hardening.conf" > "${hardening_tmp}"
     if [[ ${KEEP_SSH_22} -eq 1 && "${SSH_PORT}" != "22" ]]; then
@@ -16,15 +17,35 @@ configure_sshd() {
     write_file_atomic "${SSHD_HARDENING_DROPIN}" < "${hardening_tmp}"
     rm -f "${hardening_tmp}"
     write_file_atomic "${SSHD_CRYPTO_DROPIN}" < "${CONFIG_DIR}/sshd_crypto_hardening.conf"
+    configure_sshd_port_forwarding_dropin
     if [ "${DRY_RUN}" -eq 0 ]; then
         if ! sshd -t; then
             log_error "sshd configuration failed validation"
             restore_sshd_dropins
             exit 1
         fi
+        log_sshd_effective_port_forwarding
     else
         log_info "[DRY-RUN] Skipping sshd validation"
     fi
+}
+
+configure_sshd_port_forwarding_dropin() {
+    if [[ -z "${USER_NAME}" ]]; then
+        log_error "SSH admin user is not set; cannot configure port forwarding drop-in."
+        exit 1
+    fi
+    render_template "${CONFIG_DIR}/sshd_port_forwarding.conf" "${SSHD_PORT_FORWARDING_DROPIN}" "SSH_ADMIN_USER=${USER_NAME}"
+    ensure_file_permissions "${SSHD_PORT_FORWARDING_DROPIN}" 0644 root root
+    log_info "Configured sshd port forwarding policy for ${USER_NAME}"
+}
+
+log_sshd_effective_port_forwarding() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        log_info "[DRY-RUN] Would log effective sshd port forwarding configuration"
+        return
+    fi
+    status_cmd "sshd -T | grep -i 'allowtcpforwarding' || true"
 }
 
 ensure_admin_sudoers() {
@@ -133,7 +154,7 @@ ensure_user_in_group() {
 
 restore_sshd_dropins() {
     local restored=0 dropin latest_backup backup_pattern
-    for dropin in "${SSHD_HARDENING_DROPIN}" "${SSHD_CRYPTO_DROPIN}"; do
+    for dropin in "${SSHD_HARDENING_DROPIN}" "${SSHD_CRYPTO_DROPIN}" "${SSHD_PORT_FORWARDING_DROPIN}"; do
         latest_backup=""
         if [[ -n "${BACKUP_ROOT:-}" ]]; then
             backup_pattern="${BACKUP_ROOT}/configs/${dropin#/}"
