@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2025 Richard Majewski
+# shellcheck disable=SC2034  # globals are shared with sourced libs and steps
 set -eEuo pipefail
 
-# shellcheck disable=SC2034  # shared globals used across sourced libs and steps
 declare -g \
     PHASE0_LOG="/var/log/vps-harden.phase0.log" \
     PHASE1_LOG="/var/log/vps-harden.phase1.log" \
