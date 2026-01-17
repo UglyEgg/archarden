@@ -34,6 +34,9 @@ declare -g \
     PUBKEY_FILE="" \
     PUBKEY_VALUE="" \
     ENABLE_AUDITD=0 \
+    ENABLE_NPM=1 \
+    ENABLE_GOTIFY=1 \
+    ENABLE_UPTIME_KUMA=1 \
     SYSTEM_HOSTNAME="" \
     SSH_PORT=2122 \
     SSH_CONNECTION_INFO="" \
@@ -194,6 +197,9 @@ usage() {
     printf "  %s\n" "$(cyan "--disable-fail2ban")         Skip fail2ban configuration."
     printf "  %s\n" "$(cyan "--disable-firewall")         Skip firewall configuration (alias: --disable-ufw)."
     printf "  %s\n" "$(cyan "--skip-firewall-enable")     Write UFW rules but do not enable the firewall."
+    printf "  %s\n" "$(cyan "--disable-npm")              Skip installing Nginx Proxy Manager."
+    printf "  %s\n" "$(cyan "--disable-gotify")           Skip installing Gotify."
+    printf "  %s\n" "$(cyan "--disable-uptime-kuma")      Skip installing Uptime Kuma."
 
     printf "\n%s\n" "$(bold "$(green "Behavior")")"
     printf "  %s\n" "$(cyan "--only <steps>")             Comma-separated step list to run (phase-aware)."
@@ -242,6 +248,12 @@ parse_args() {
                 ENABLE_FIREWALL=0; shift;;
             --skip-firewall-enable) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
                 SKIP_FIREWALL_ENABLE=1; shift;;
+            --disable-npm) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                ENABLE_NPM=0; shift;;
+            --disable-gotify) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                ENABLE_GOTIFY=0; shift;;
+            --disable-uptime-kuma) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                ENABLE_UPTIME_KUMA=0; shift;;
             --only) parse_step_filters "$2" ONLY_STEPS; shift 2;;
             --skip) parse_step_filters "$2" SKIP_STEPS; shift 2;;
             --dry-run) DRY_RUN=1; shift;;
