@@ -20,5 +20,7 @@
 # --disable-fail2ban                   # Skip fail2ban setup.
 # --disable-firewall                   # Skip firewall configuration (alias: --disable-ufw).
 # --skip-firewall-enable               # Write UFW rules but do not enable the firewall.
+# --disable-npm                        # Skip installing Nginx Proxy Manager.
+# --disable-gotify                     # Skip installing Gotify.
+# --disable-uptime-kuma                # Skip installing Uptime Kuma.
 # --dry-run                            # Preview actions without making changes.
-

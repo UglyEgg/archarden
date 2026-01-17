@@ -63,13 +63,19 @@ configure_podman_templates() {
     write_file_atomic /usr/share/vps-harden/README <<'EOT'
 Podman templates installed by vps-harden.
 EOT
-    write_file_atomic "${dest_dir}/nginx-proxy-manager.container" < "${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
-    write_file_atomic "${dest_dir}/podman-run-npm.sh" < "${TEMPLATES_DIR}/containers/podman-run-npm.sh"
-    write_file_atomic "${dest_dir}/gotify.container" < "${TEMPLATES_DIR}/containers/gotify.container"
-    write_file_atomic "${dest_dir}/uptime-kuma.container" < "${TEMPLATES_DIR}/containers/uptime-kuma.container"
-    write_file_atomic "${dest_dir}/podman-run-gotify.sh" < "${TEMPLATES_DIR}/containers/podman-run-gotify.sh"
-    run_cmd "chmod +x ${dest_dir}/podman-run-npm.sh"
-    run_cmd "chmod +x ${dest_dir}/podman-run-gotify.sh"
+    if (( ENABLE_NPM )); then
+        write_file_atomic "${dest_dir}/nginx-proxy-manager.container" < "${TEMPLATES_DIR}/containers/nginx-proxy-manager.container"
+        write_file_atomic "${dest_dir}/podman-run-npm.sh" < "${TEMPLATES_DIR}/containers/podman-run-npm.sh"
+        run_cmd "chmod +x ${dest_dir}/podman-run-npm.sh"
+    fi
+    if (( ENABLE_GOTIFY )); then
+        write_file_atomic "${dest_dir}/gotify.container" < "${TEMPLATES_DIR}/containers/gotify.container"
+        write_file_atomic "${dest_dir}/podman-run-gotify.sh" < "${TEMPLATES_DIR}/containers/podman-run-gotify.sh"
+        run_cmd "chmod +x ${dest_dir}/podman-run-gotify.sh"
+    fi
+    if (( ENABLE_UPTIME_KUMA )); then
+        write_file_atomic "${dest_dir}/uptime-kuma.container" < "${TEMPLATES_DIR}/containers/uptime-kuma.container"
+    fi
 }
 
 ensure_containers_runtime_config() {
@@ -695,6 +701,58 @@ ensure_uptime_kuma_quadlet() {
     rm -f "${tmp_in}" "${tmp_out}"
 }
 
+podman::enabled_services() {
+    local -n target=$1
+    target=()
+    if (( ENABLE_NPM )); then
+        target+=("nginx-proxy-manager.service")
+    fi
+    if (( ENABLE_GOTIFY )); then
+        target+=("gotify.service")
+    fi
+    if (( ENABLE_UPTIME_KUMA )); then
+        target+=("uptime-kuma.service")
+    fi
+}
+
+podman::enabled_service_regex() {
+    local -a services=()
+    if (( ENABLE_NPM )); then
+        services+=("nginx-proxy-manager")
+    fi
+    if (( ENABLE_GOTIFY )); then
+        services+=("gotify")
+    fi
+    if (( ENABLE_UPTIME_KUMA )); then
+        services+=("uptime-kuma")
+    fi
+    if [[ ${#services[@]} -eq 0 ]]; then
+        return 1
+    fi
+    local joined
+    joined=$(IFS='|'; echo "${services[*]}")
+    echo "${joined}"
+}
+
+podman::admin_ports_regex() {
+    local -a ports=()
+    if (( ENABLE_NPM )); then
+        ports+=("81")
+    fi
+    if (( ENABLE_UPTIME_KUMA )); then
+        ports+=("3001")
+    fi
+    if (( ENABLE_GOTIFY )); then
+        ports+=("${GOTIFY_PORT}")
+    fi
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        return 1
+    fi
+    local joined
+    joined=$(IFS='|'; echo "${ports[*]}")
+    echo "${joined}"
+}
+
 verify_quadlet_status() {
     local service="$1"
     if ! ensure_podmin_user_manager; then
@@ -705,8 +763,8 @@ verify_quadlet_status() {
         return 0
     fi
     log_warn "Status check failed for ${service}; inspecting generated units"
-    run_cmd "systemctl --user --machine=${PODMAN_USER}@.host list-unit-files --no-pager | grep -E 'nginx-proxy-manager|gotify' || true"
-    run_cmd "ls -la /run/user/${PODMAN_UID}/systemd/generator/ | grep -E 'nginx-proxy-manager|gotify' || true"
+    run_cmd "systemctl --user --machine=${PODMAN_USER}@.host list-unit-files --no-pager | grep -E 'nginx-proxy-manager|gotify|uptime-kuma' || true"
+    run_cmd "ls -la /run/user/${PODMAN_UID}/systemd/generator/ | grep -E 'nginx-proxy-manager|gotify|uptime-kuma' || true"
 }
 
 configure_rootless_quadlets() {
@@ -715,11 +773,25 @@ configure_rootless_quadlets() {
         log_warn "Skipping rootless quadlet configuration because Podman prerequisites are not satisfied: ${PODMAN_PREREQ_REASON:-unknown}."
         return
     fi
-    ensure_npm_quadlet
-    ensure_gotify_quadlet
-    ensure_uptime_kuma_quadlet
+    if (( ENABLE_NPM )); then
+        ensure_npm_quadlet
+    fi
+    if (( ENABLE_GOTIFY )); then
+        ensure_gotify_quadlet
+    fi
+    if (( ENABLE_UPTIME_KUMA )); then
+        ensure_uptime_kuma_quadlet
+    fi
     systemd_dir=$(quadlet::systemd_dir)
-    quadlet::check_duplicate_publish_ports "${systemd_dir}/nginx-proxy-manager.container"
+    if (( ENABLE_NPM )); then
+        quadlet::check_duplicate_publish_ports "${systemd_dir}/nginx-proxy-manager.container"
+    fi
+    local -a services=()
+    podman::enabled_services services
+    if [[ ${#services[@]} -eq 0 ]]; then
+        log_info "No Podman quadlets enabled; skipping rootless quadlet activation."
+        return
+    fi
     if ! ensure_quadlet_generator; then
         return
     fi
@@ -731,11 +803,6 @@ configure_rootless_quadlets() {
     podmin_systemctl reset-failed || true
     podmin_systemctl daemon-reload || true
 
-    local services=(
-        nginx-proxy-manager.service
-        gotify.service
-        uptime-kuma.service
-    )
     local service container_file container_path
     for service in "${services[@]}"; do
         container_file="${service%.service}.container"
@@ -1147,6 +1214,10 @@ gotify::verify() {
 }
 
 configure_gotify_notifications() {
+    if (( ENABLE_GOTIFY == 0 )); then
+        log_info "Gotify disabled; skipping notification setup."
+        return
+    fi
     gotify::ensure_container_running
     gotify::ensure_token
     gotify::install_notify_script
@@ -1677,6 +1748,8 @@ EOF
 
 write_user_readme() {
     local target_user="${USER_NAME}" target_home readme_path alt_readme marker dest vpn_ip gotify_port npm_port=81 kuma_port=3001 wg_client_dir="/root/wireguard/clients"
+    local -a firewall_rules admin_urls admin_ports
+    local firewall_rules_text admin_urls_text admin_ports_check_line
     marker="${README_MARKER}"
     gotify_port=${GOTIFY_PORT}
     vpn_ip="${WIREGUARD_SERVER_IP:-${WG_INTERFACE_ADDRESS%%/*}}"
@@ -1699,6 +1772,39 @@ write_user_readme() {
         dest="${alt_readme}"
     elif [[ -f "${alt_readme}" ]] && grep -qF "${marker}" "${alt_readme}"; then
         dest="${alt_readme}"
+    fi
+
+    if (( ENABLE_NPM )); then
+        firewall_rules+=("  - sudo ufw allow in on wg0 to any port ${npm_port} proto tcp comment 'NPM Admin (VPN)'")
+        admin_urls+=("  - NPM Admin: http://${vpn_ip}:${npm_port}")
+        admin_ports+=("${npm_port}")
+    fi
+    if (( ENABLE_UPTIME_KUMA )); then
+        firewall_rules+=("  - sudo ufw allow in on wg0 to any port ${kuma_port} proto tcp comment 'Uptime Kuma (VPN)'")
+        admin_urls+=("  - Uptime Kuma: http://${vpn_ip}:${kuma_port}")
+        admin_ports+=("${kuma_port}")
+    fi
+    if (( ENABLE_GOTIFY )); then
+        firewall_rules+=("  - sudo ufw allow in on wg0 to any port ${gotify_port} proto tcp comment 'Gotify (VPN)'")
+        admin_urls+=("  - Gotify: http://${vpn_ip}:${gotify_port}")
+        admin_ports+=("${gotify_port}")
+    fi
+    if [[ ${#firewall_rules[@]} -gt 0 ]]; then
+        firewall_rules_text=$(printf "%s\n" "${firewall_rules[@]}")
+    else
+        firewall_rules_text="  - (No Podman admin services enabled.)"
+    fi
+    if [[ ${#admin_urls[@]} -gt 0 ]]; then
+        admin_urls_text=$(printf "%s\n" "${admin_urls[@]}")
+    else
+        admin_urls_text="  - (No Podman admin services enabled.)"
+    fi
+    if [[ ${#admin_ports[@]} -gt 0 ]]; then
+        local ports_joined
+        ports_joined=$(IFS='|'; echo "${admin_ports[*]}")
+        admin_ports_check_line="  - ss -lntup | grep -E ':(${ports_joined})\\b' || true"
+    else
+        admin_ports_check_line="  - (No admin ports to verify.)"
     fi
 
     local content
@@ -1724,28 +1830,22 @@ ${marker}
 ## 2. Bind admin ports to the VPN interface only
 - Policy: admin services stay off the public internet; they should only listen on wg0.
 - Apply/confirm UFW rules:
-  - sudo ufw allow in on wg0 to any port ${npm_port} proto tcp comment 'NPM Admin (VPN)'
-  - sudo ufw allow in on wg0 to any port ${kuma_port} proto tcp comment 'Uptime Kuma (VPN)'
-  - sudo ufw allow in on wg0 to any port ${gotify_port} proto tcp comment 'Gotify (VPN)'
+${firewall_rules_text}
 - Verify:
   - sudo ufw status verbose
-  - ss -lntup | grep -E ':(81|3001|${gotify_port})\\b' || true
+${admin_ports_check_line}
   - (Optional) External scans should NOT show these ports.
 
 ## 3. Connect to admin services (after VPN is up)
 - Use a browser (or SSH tunnel if preferred) after VPN is up to configure each service:
-  - NPM Admin: http://${vpn_ip}:${npm_port}
-  - Uptime Kuma: http://${vpn_ip}:${kuma_port}
-  - Gotify: http://${vpn_ip}:${gotify_port}
+${admin_urls_text}
 
 ## 4. OPTIONAL (after verifying VPN works)
 - Restrict SSH to the VPN only (keep console/rescue for break-glass access):
   - sudo ufw delete limit ${SSH_PORT}/tcp || sudo ufw delete allow ${SSH_PORT}/tcp
   - sudo ufw allow in on wg0 to any port ${SSH_PORT} proto tcp comment 'SSH (VPN only)'
 - Restrict admin ports to wg0 if not already done:
-  - sudo ufw allow in on wg0 to any port ${npm_port} proto tcp comment 'NPM Admin (VPN)'
-  - sudo ufw allow in on wg0 to any port ${kuma_port} proto tcp comment 'Uptime Kuma (VPN)'
-  - sudo ufw allow in on wg0 to any port ${gotify_port} proto tcp comment 'Gotify (VPN)'
+${firewall_rules_text}
 - Post-VPN validation:
   - Confirm no public-facing allow/limit rules remain for SSH or admin ports.
   - Re-scan from outside the VPN to verify only expected services are exposed.
@@ -2044,6 +2144,8 @@ status_report() {
 
 final_container_checks() {
     log_info "==== FINAL CONTAINER AND PORT CHECK ===="
+    local -a services=()
+    local admin_ports_regex service_regex
     if [[ ${DRY_RUN} -eq 1 ]]; then
         log_info "[DRY-RUN] Would verify podmin containers and admin ports"
         return
@@ -2057,8 +2159,19 @@ final_container_checks() {
     else
         log_warn "podman or runuser not available; skipping podman ps check"
     fi
-    run_status_capture "podmin services" bash -c "systemctl --user --machine=${PODMAN_USER}@.host list-units --type=service --state=running | grep -E 'nginx-proxy-manager|gotify|uptime-kuma' || true"
-    run_status_capture "admin ports listening" bash -c "ss -lntup | grep -E ':(81|3001|${GOTIFY_PORT})\\b' || true"
+    podman::enabled_services services
+    if [[ ${#services[@]} -gt 0 ]]; then
+        if service_regex=$(podman::enabled_service_regex); then
+            run_status_capture "podmin services" bash -c "systemctl --user --machine=${PODMAN_USER}@.host list-units --type=service --state=running | grep -E '${service_regex}' || true"
+        fi
+    else
+        log_info "No Podman quadlet services enabled; skipping service status check."
+    fi
+    if admin_ports_regex=$(podman::admin_ports_regex); then
+        run_status_capture "admin ports listening" bash -c "ss -lntup | grep -E ':(${admin_ports_regex})\\b' || true"
+    else
+        log_info "No admin ports configured; skipping port check."
+    fi
 }
 
 
