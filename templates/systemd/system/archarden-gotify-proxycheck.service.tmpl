@@ -1,0 +1,8 @@
+[Unit]
+Description=Archarden Gotify proxy reachability check (notifies via Gotify)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=__LIB_DIR__/gotify_proxy_check.sh

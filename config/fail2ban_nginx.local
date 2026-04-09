@@ -1,0 +1,15 @@
+[nginx-http-auth]
+enabled  = __ENABLE__
+port     = http,https
+logpath  = __NPM_LOG_GLOB__
+maxretry = 6
+findtime = 10m
+bantime  = 1h
+
+[nginx-botsearch]
+enabled  = __ENABLE__
+port     = http,https
+logpath  = __NPM_LOG_GLOB__
+maxretry = 20
+findtime = 10m
+bantime  = 1h

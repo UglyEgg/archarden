@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Watches rootless Podman container events for the podmin user and
+# sends Gotify notifications on container restarts/exits.
+
+PODMAN_USER="podmin"
+PODMAN_UID="$(id -u "${PODMAN_USER}")"
+HOME_DIR="$(getent passwd "${PODMAN_USER}" | cut -d: -f6)"
+RUNTIME_DIR="/run/user/${PODMAN_UID}"
+
+if [[ ! -d "${RUNTIME_DIR}" ]]; then
+  echo "Runtime dir ${RUNTIME_DIR} not present; user manager may be down" >&2
+  exit 1
+fi
+
+runuser -u "${PODMAN_USER}" -- bash -c "cd \"${HOME_DIR}\" && exec env HOME=\"${HOME_DIR}\" XDG_RUNTIME_DIR=\"${RUNTIME_DIR}\" podman events --format json --filter type=container --filter event=restart --filter event=die" \
+| while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    # Best-effort parse; do not die on malformed lines.
+    name=$(echo "${line}" | jq -r '.Name // empty' 2>/dev/null || true)
+    status=$(echo "${line}" | jq -r '.Status // empty' 2>/dev/null || true)
+    time=$(echo "${line}" | jq -r '.Time // empty' 2>/dev/null || true)
+    exit_code=$(echo "${line}" | jq -r '.Attributes.exitCode // empty' 2>/dev/null || true)
+
+    title="Archarden: container ${status:-event}"
+    msg="time=${time}\nname=${name:-unknown}\nstatus=${status:-unknown}"
+    if [[ -n "${exit_code}" ]]; then
+      msg="${msg}\nexitCode=${exit_code}"
+    fi
+
+    /usr/lib/archarden/gotify_send.sh "${title}" "${msg}" || true
+  done

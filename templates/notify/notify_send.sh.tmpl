@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+notify_env="/etc/archarden/notify.env"
+if [[ -f "${notify_env}" ]]; then
+  # shellcheck disable=SC1090
+  source "${notify_env}"
+fi
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: ${0} <title> <message> [priority]" >&2
+  exit 1
+fi
+
+title="$1"
+message="$2"
+priority="${3:-${NTFY_PRIORITY:-5}}"
+
+if [[ ${#message} -gt 3500 ]]; then
+  message="${message:0:3500}"
+fi
+
+if [[ -z "${NTFY_URL:-}" || -z "${NTFY_TOPIC:-}" ]]; then
+  echo "ntfy not configured; skipping notification" >&2
+  exit 0
+fi
+
+declare -a curl_args=( -fsS -X POST -H "Title: ${title}" -H "Priority: ${priority}" )
+if [[ -n "${NTFY_TOKEN:-}" ]]; then
+  curl_args+=( -H "Authorization: Bearer ${NTFY_TOKEN}" )
+elif [[ -n "${NTFY_USER:-}" ]]; then
+  curl_args+=( -u "${NTFY_USER}:${NTFY_PASS:-}" )
+fi
+
+if ! curl "${curl_args[@]}" "${NTFY_URL%/}/${NTFY_TOPIC}" -d "${message}" >/dev/null; then
+  echo "Failed to send ntfy notification" >&2
+fi

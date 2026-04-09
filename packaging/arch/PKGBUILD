@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 Richard Majewski
+
+pkgname=archarden
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="Harden a fresh Arch Linux VPS"
+arch=(any)
+license=(GPL3)
+depends=(bash coreutils iproute2 systemd openssh)
+source=("${pkgname}-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+
+  install -D -m 0755 archarden "${pkgdir}/usr/bin/archarden"
+
+  install -d -m 0755 "${pkgdir}/usr/lib/archarden"
+  install -m 0644 lib/*.sh "${pkgdir}/usr/lib/archarden/"
+
+  install -d -m 0755 "${pkgdir}/usr/share/archarden"
+  cp -a config templates docs "${pkgdir}/usr/share/archarden/"
+
+  install -D -m 0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

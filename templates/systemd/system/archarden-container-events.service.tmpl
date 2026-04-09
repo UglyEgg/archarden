@@ -1,0 +1,13 @@
+[Unit]
+Description=Archarden container restart/exit notifications (notification)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__LIB_DIR__/container_event_watch.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Archarden Fail2Ban daily summary notification
+After=network-online.target fail2ban.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=__LIB_DIR__/fail2ban_daily_summary.sh

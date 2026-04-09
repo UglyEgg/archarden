@@ -1,0 +1,14 @@
+[Unit]
+Description=archarden shared Podman network
+
+[Network]
+NetworkName=archarden
+Driver=bridge
+Label=app=archarden
+
+# Note: network subnet/gateway are intentionally not set here.
+# Rootless networking implementations differ across Podman backends.
+# The hardener ensures the network exists via `podman network create`.
+
+[Install]
+WantedBy=default.target

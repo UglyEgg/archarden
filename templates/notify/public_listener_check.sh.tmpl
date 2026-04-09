@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+out=""
+rc=0
+
+if ! out=$(/usr/bin/archarden verify 2>&1); then
+  rc=$?
+fi
+
+if [[ ${rc} -eq 0 ]]; then
+  exit 0
+fi
+
+msg=$(echo "${out}" | sed -n '1,200p')
+/usr/lib/archarden/notify_send.sh "Archarden: unexpected listeners" "${msg}" || true
+exit 0

@@ -1,0 +1,6 @@
+[Unit]
+Description=Scan rootless containers for updates via podman auto-update (dry-run)
+
+[Service]
+Type=oneshot
+ExecStart=__LIB_DIR__/container_update_scan.sh

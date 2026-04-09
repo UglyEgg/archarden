@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Archarden unexpected public listener check periodically
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=5m
+AccuracySec=30s
+Unit=archarden-portwatch.service
+
+[Install]
+WantedBy=timers.target

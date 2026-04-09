@@ -1,0 +1,8 @@
+[Unit]
+Description=Archarden unexpected public listener check (notification)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=__LIB_DIR__/public_listener_check.sh

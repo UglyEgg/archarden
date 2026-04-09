@@ -1,0 +1,156 @@
+# archarden.params (template / guide / mini-doc)
+#
+# File format
+# - Lines beginning with '#' are comments.
+# - To enable a setting, remove the leading "# " from the line.
+# - Keep each flag on a single line.
+# - Avoid inline comments after a flag/value: anything after a "#" is stripped.
+#
+# Precedence
+#   CLI > /var/lib/archarden/answers.params > ./archarden.params (legacy)
+#
+# Canonical persisted inputs
+# - On a real run of `archarden apply` (not --dry-run, not --resume), archarden writes
+#   durable inputs to /var/lib/archarden/answers.params.
+# - This file is a reference template and a legacy fallback for clean installs.
+#
+# Quick start (minimal bootstrap)
+#   sudo ./archarden apply \
+#     --hostname "your.host.example" \
+#     --user "admin" \
+#     --pubkey-file "/path/to/id_ed25519.pub"
+#
+# ==================================================
+# apply (default) — bootstrap hardening (phase0/1)
+# ==================================================
+#
+# Required (apply)
+# --hostname "your.host.example"
+# --user "admin"
+# # Choose exactly one:
+# --pubkey-file "/path/to/id_ed25519.pub"
+# # --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... comment"
+#
+# SSH (apply)
+# --ssh-port 2122
+# --restrict-ssh-cidr "203.0.113.0/24"
+# --keep-ssh-22
+#
+# Services / hardening toggles (apply)
+# --enable-auditd
+# --disable-fail2ban
+# --disable-firewall
+#   (alias: --disable-ufw)
+# --skip-firewall-enable
+#
+# Persisted runtime inputs (apply; also used by other commands)
+#
+# Required when you intend to expose ntfy through NPM with Let's Encrypt:
+# --le-email "you@example.com"
+#
+# Optional:
+# --npm-admin-email defaults to --le-email when omitted.
+#
+# IMPORTANT:
+# - Use a real public email address.
+# - Do not use .internal, .local, or invented domains.
+# - If --ntfy-public-host is set, --le-email must also be set.
+#
+# --le-email "you@example.com"
+# # --npm-admin-email "you@example.com"
+#
+# WireGuard
+# # --wg-peers 3
+# --wg-interface-address "10.66.66.1/24"
+#
+# Public-facing hostnames
+# - ntfy is the intended public service.
+# - Uptime Kuma and NPM admin are expected to remain WireGuard-only unless you
+#   intentionally change that later.
+# # Repeatable (use multiple lines):
+# --public-host "example.com"
+# --public-host "www.example.com"
+# --ntfy-public-host "ntfy.example.com"
+#
+# Behavior (apply)
+# --dry-run  (root-only; logs planned mutations and would-write content)
+# --only "step_a,step_b"
+#   (comma-separated; phase-aware)
+# --skip "step_c,step_d"
+#   (comma-separated; phase-aware)
+#
+# Internal (do not set in a params file)
+# # --resume
+#
+# =======================
+# lockdown — stage 2 tool
+# =======================
+#
+# Usage: sudo ./archarden lockdown [--status|--revert] [--dry-run] [shared inputs]
+# Example: sudo ./archarden lockdown --status
+# - --status and --revert are mutually exclusive.
+# - Uses the same persisted inputs as apply (ssh port, etc.) when present.
+#
+# Lockdown flags
+# --status
+# --revert
+# --dry-run  (root-only; logs planned mutations and would-write content)
+#
+# =====================
+# verify — exposure check
+# =====================
+#
+# Usage: sudo ./archarden verify [--dry-run] [shared inputs]
+# - No additional flags beyond the shared inputs above.
+#
+# ==========================
+# creds — credential rotation
+# ==========================
+#
+# Usage: sudo ./archarden creds [shared inputs]
+# - No additional flags beyond the shared inputs above.
+#
+# ==============================
+# doctor — diagnostics / reporting
+# ==============================
+#
+# Usage: sudo ./archarden doctor [--dry-run] [doctor flags] [shared inputs]
+# Example (JSON): sudo ./archarden doctor --json --dry-run
+# - --json outputs JSON only.
+# - --bundle writes a redacted tarball (uses --bundle-dir).
+#
+# Doctor flags
+# --verbose
+# --json
+# --bundle
+# --bundle-dir "/var/lib/archarden/doctor"
+# --dry-run  (root-only; logs planned mutations and would-write content)
+#
+# ===================================
+# notify init — ntfy notification env
+# ===================================
+#
+# Usage: sudo ./archarden notify init [options]
+# - This subcommand does NOT require --hostname/--user.
+# - If --ntfy-url is omitted, archarden uses https://<--ntfy-public-host> when set.
+# - ntfy is the only notification backend.
+#
+# Notify init flags
+# # --test
+# --dry-run  (root-only; logs planned mutations and would-write content)
+#
+# ==========================
+# wg export — client retrieval
+# ==========================
+#
+# Usage: sudo ./archarden wg export [options]
+# - This subcommand does NOT require --hostname/--user.
+#
+# wg export flags
+# --output-dir "/var/lib/archarden/wireguard/exports"
+# --dry-run  (root-only; logs planned mutations and would-write content)
+#
+# ============
+# Not for files
+# ============
+# --help / --version are interactive CLI conveniences and should not be placed in a params file.

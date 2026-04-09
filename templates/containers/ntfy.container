@@ -1,0 +1,30 @@
+[Unit]
+Description=ntfy notification service
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Network=archarden
+NetworkAlias=ntfy
+ContainerName=ntfy
+Image=docker.io/binwiederhier/ntfy:latest
+Environment=TZ=UTC
+PublishPort=127.0.0.1:2586:80/tcp
+Volume=%h/.local/share/ntfy/cache:/var/cache/ntfy:Z
+Volume=%h/.local/share/ntfy/data:/var/lib/ntfy:Z
+Volume=%h/.config/archarden/ntfy/server.yml:/etc/ntfy/server.yml:ro
+AutoUpdate=registry
+Memory=128M
+PidsLimit=256
+Exec=serve
+PodmanArgs=--init
+
+[Service]
+WorkingDirectory=%h
+ExecStartPre=/usr/bin/bash -lc '/usr/bin/podman network exists archarden || /usr/bin/podman network create --label app=archarden archarden'
+ExecStartPre=/usr/bin/podman network inspect archarden
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

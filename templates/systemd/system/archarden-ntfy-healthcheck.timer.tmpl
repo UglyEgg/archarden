@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Archarden ntfy endpoint reachability check daily
+
+[Timer]
+OnCalendar=*-*-* 09:10:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

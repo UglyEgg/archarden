@@ -4,16 +4,25 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
+Network=archarden
+NetworkAlias=gotify
 ContainerName=gotify
-Image=docker.io/gotify/server:2.5.0
+Image=docker.io/gotify/server:2
 Environment=TZ=UTC
-PublishPort=127.0.0.1:9090:80
+# Credentials are provided via a podmin-readable env file written by archarden.
+EnvironmentFile=%h/.config/archarden/gotify.env
 Volume=gotify-data:/app/data
-PodmanArgs=--pull=never --read-only=false --pids-limit=256 --memory=256m
+AutoUpdate=registry
 Memory=128M
 PidsLimit=256
 
 [Service]
+# Some call-sites execute as podmin from an arbitrary directory (often /root during hand-off).
+# Ensure systemd starts the unit from a directory podmin can access.
+WorkingDirectory=%h
+# Ensure the shared user network exists before container start.
+ExecStartPre=/usr/bin/bash -lc '/usr/bin/podman network exists archarden || /usr/bin/podman network create --label app=archarden archarden'
+ExecStartPre=/usr/bin/podman network inspect archarden
 Restart=on-failure
 RestartSec=5s
 

@@ -1,3 +1,6 @@
+## SPDX-License-Identifier: GPL-3.0-or-later
+## Copyright 2026 Richard Majewski
+
 name: CI
 
 on:
@@ -18,6 +21,9 @@ jobs:
 
       - name: Run lint
         run: make lint
+
+      - name: Check formatting
+        run: make fmt-check
 
       - name: Run tests
         run: make test

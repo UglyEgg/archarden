@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+notify_bin="/usr/lib/archarden/gotify_send.sh"
+
+# Summarize fail2ban bans in the last 24 hours by jail, and send a single daily Gotify message.
+# Avoids per-ban spam while still giving "how popular are we?" visibility.
+
+since="24 hours ago"
+
+log_data=""
+
+# Prefer journald if fail2ban logs there.
+if command -v journalctl >/dev/null 2>&1; then
+  if journalctl -u fail2ban.service --since "${since}" --no-pager >/dev/null 2>&1; then
+    log_data="$(journalctl -u fail2ban.service --since "${since}" --no-pager 2>/dev/null || true)"
+  elif journalctl -u fail2ban --since "${since}" --no-pager >/dev/null 2>&1; then
+    log_data="$(journalctl -u fail2ban --since "${since}" --no-pager 2>/dev/null || true)"
+  fi
+fi
+
+# Fallback: /var/log/fail2ban.log
+if [[ -z "${log_data}" ]] && [[ -r /var/log/fail2ban.log ]]; then
+  # Best-effort: take recent lines. Time filtering is tricky across distros/log formats.
+  log_data="$(tail -n 20000 /var/log/fail2ban.log 2>/dev/null || true)"
+fi
+
+if [[ -z "${log_data}" ]]; then
+  "${notify_bin}" "Fail2Ban daily summary" "No fail2ban log data found for the past 24h. (No journald entries; /var/log/fail2ban.log unreadable/missing.)" "info" || true
+  exit 0
+fi
+
+summary="$(awk '
+function bump_jail(j) { bans[j]++; total_bans++ }
+function bump_ip(ip) { ips[ip]++; total_ips++ }
+{
+  # Capture jail name in [jail]
+  j=""
+  if (match($0, /\[[^\]]+\]/)) {
+    j=substr($0, RSTART+1, RLENGTH-2)
+  }
+  # Count bans
+  if (match($0, /\<Ban\> [0-9a-fA-F\.:]+/)) {
+    if (j == "") j="unknown"
+    bump_jail(j)
+    ip=substr($0, RSTART+4, RLENGTH-4)
+    bump_ip(ip)
+  }
+}
+END {
+  if (total_bans == 0) {
+    print "No bans recorded in the past 24h."
+    exit
+  }
+
+  print "Bans (last 24h): " total_bans
+  print ""
+  print "By jail:"
+  # Sort by count desc (gawk asorti with custom comparator not portable); do a simple selection loop.
+  for (i in bans) {
+    # store keys for second pass
+    keys[++n]=i
+  }
+  # naive O(n^2) sort; n is tiny
+  for (i=1;i<=n;i++) {
+    for (k=i+1;k<=n;k++) {
+      if (bans[keys[k]] > bans[keys[i]]) {
+        tmp=keys[i]; keys[i]=keys[k]; keys[k]=tmp
+      }
+    }
+  }
+  for (i=1;i<=n;i++) {
+    printf "  - %s: %d\n", keys[i], bans[keys[i]]
+  }
+
+  print ""
+  print "Top source IPs:"
+  # collect IP keys
+  m=0
+  for (p in ips) ipkeys[++m]=p
+  for (i=1;i<=m;i++) {
+    for (k=i+1;k<=m;k++) {
+      if (ips[ipkeys[k]] > ips[ipkeys[i]]) {
+        tmp=ipkeys[i]; ipkeys[i]=ipkeys[k]; ipkeys[k]=tmp
+      }
+    }
+  }
+  limit=(m<10)?m:10
+  for (i=1;i<=limit;i++) {
+    printf "  - %s: %d\n", ipkeys[i], ips[ipkeys[i]]
+  }
+}
+' <<< "${log_data}")"
+
+"${notify_bin}" "Fail2Ban daily summary" "${summary}" "info" || true

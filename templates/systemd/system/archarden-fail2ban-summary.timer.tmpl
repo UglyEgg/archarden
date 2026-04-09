@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Archarden Fail2Ban daily summary notification
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

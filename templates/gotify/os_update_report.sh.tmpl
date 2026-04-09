@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+notify_bin="/usr/lib/archarden/gotify_send.sh"
+updates_output=""
+audit_output=""
+
+if command -v checkupdates >/dev/null 2>&1; then
+  updates_output=$(checkupdates 2>/dev/null || true)
+else
+  echo "checkupdates not available; skipping pacman update check" >&2
+fi
+
+if command -v arch-audit >/dev/null 2>&1; then
+  audit_output=$(arch-audit 2>/dev/null || true)
+else
+  echo "arch-audit not available; skipping advisory check" >&2
+fi
+
+if [[ -z "${updates_output}" && -z "${audit_output}" ]]; then
+  exit 0
+fi
+
+message="PACMAN UPDATES"
+if [[ -n "${updates_output}" ]]; then
+  message+="
+${updates_output}"
+else
+  message+="
+None"
+fi
+
+message+="
+
+ARCH-AUDIT"
+if [[ -n "${audit_output}" ]]; then
+  message+="
+${audit_output}"
+else
+  message+="
+None"
+fi
+
+"${notify_bin}" "Arch updates and advisories" "${message}"

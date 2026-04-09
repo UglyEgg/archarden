@@ -3,3 +3,4 @@
 # When the preferred package is requested and the installed package is present,
 # the installed package will be removed before installing the preferred one.
 iptables iptables-nft
+iptables-legacy iptables-nft

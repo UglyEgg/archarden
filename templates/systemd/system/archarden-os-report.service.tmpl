@@ -1,0 +1,6 @@
+[Unit]
+Description=Send daily Arch update and advisory report via ntfy
+
+[Service]
+Type=oneshot
+ExecStart=__LIB_DIR__/os_update_report.sh

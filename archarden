@@ -1,0 +1,953 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 Richard Majewski
+# shellcheck disable=SC2034  # globals are shared with sourced libs and steps
+set -eEuo pipefail
+
+
+archarden::__on_err() {
+  # Purpose: Emit a high-signal error report when execution fails under strict mode.
+  # Inputs: None (reads bash error context variables).
+  # Outputs: Writes failure context and a stack trace to stderr.
+  #
+  # Notes:
+  # - If utils::__on_err is available (after modules are sourced), delegate to it.
+  # - Before modules are loaded, fall back to a minimal built-in report.
+  # When invoked from an ERR trap, $? is not reliable in all bash contexts
+  # (notably command substitutions). Prefer an explicit rc argument when
+  # provided by the trap.
+  local rc="${1:-$?}"
+
+  # Disable strict behavior inside the trap handler.
+  set +e
+  set +u
+
+  if declare -F utils::__on_err >/dev/null 2>&1; then
+    utils::__on_err
+    return "${rc}"
+  fi
+
+  local cmd="${2:-${BASH_COMMAND-<unknown>}}"
+  local src="${BASH_SOURCE[1]-${BASH_SOURCE[0]-<unknown>}}"
+  local line="${BASH_LINENO[0]-?}"
+  local func="${FUNCNAME[1]-${FUNCNAME[0]-<toplevel>}}"
+
+  {
+    printf "\n"
+    printf "ERROR: rc=%s\n" "${rc}"
+    printf "  cmd: %s\n" "${cmd}"
+    printf "  at : %s:%s in %s()\n" "${src}" "${line}" "${func}"
+    printf "  stack:\n"
+    local i
+    for ((i=1; i<${#FUNCNAME[@]}; i++)); do
+      local fn="${FUNCNAME[$i]-<unknown>}"
+      local fsrc="${BASH_SOURCE[$i]-<unknown>}"
+      local fln="${BASH_LINENO[$((i-1))]-?}"
+      printf "    #%s %s() at %s:%s\n" "$i" "${fn}" "${fsrc}" "${fln}"
+    done
+    printf "\n"
+  } >&2
+
+  return "${rc}"
+}
+
+
+trap 'archarden::__on_err "$?" "$BASH_COMMAND"' ERR
+
+
+# Preserve any LOG_FILE provided by the caller (e.g., tests).
+
+ENV_LOG_FILE="${LOG_FILE-}"
+
+# -----------------------------------------------------------------------------
+# Constants (read-only)
+# These values describe fixed filesystem locations and stable defaults used
+# across modules. Treat them as part of the public contract of the installer.
+# -----------------------------------------------------------------------------
+# Paths: logs
+declare -gr \
+    PHASE0_LOG="/var/log/archarden.phase0.log" \
+    PHASE1_LOG="/var/log/archarden.phase1.log"
+
+# Paths: SSHD drop-ins
+declare -gr \
+    SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d" \
+    SSHD_HARDENING_DROPIN="/etc/ssh/sshd_config.d/10-hardening.conf" \
+    SSHD_CRYPTO_DROPIN="/etc/ssh/sshd_config.d/10-crypto-hardening.conf" \
+    SSHD_PORT_FORWARDING_DROPIN="/etc/ssh/sshd_config.d/20-portforwarding.conf" \
+    SSHD_WG_ONLY_DROPIN="/etc/ssh/sshd_config.d/30-wg-only.conf"
+
+# Paths: backups
+declare -gr \
+    BACKUP_ROOT_BASE="/root/archarden-backups" \
+    SSH_HOSTKEY_BACKUP_CATEGORY="ssh-hostkeys"
+
+# Paths: install locations
+declare -gr \
+    DEFAULT_INSTALL_PREFIX="/usr/lib/archarden" \
+    INSTALL_PREFIX="/usr/lib/archarden" \
+    INSTALL_BIN="/usr/bin/archarden"
+
+# Paths: state and markers
+declare -gr \
+    STATE_DIR="/var/lib/archarden" \
+    LOCKDOWN_MARKER_FILE="/var/lib/archarden/lockdown.marker" \
+    DOCTOR_BUNDLE_DIR="/var/lib/archarden/doctor" \
+    PENDING_ARGS_FILE="/var/lib/archarden/pending_args" \
+    PERSISTED_PUBKEY_FILE="/var/lib/archarden/pubkey" \
+    RUN_ID_FILE="/var/lib/archarden/run_id"
+
+# Paths: systemd units
+declare -gr \
+    CONTINUE_SERVICE="/etc/systemd/system/archarden-continue.service"
+
+# Paths: wireguard exports
+declare -gr \
+    WG_EXPORT_DIR="${STATE_DIR}/wireguard/exports"
+
+# Other constants
+declare -gr \
+    GRUB_LTS_ENTRY="Advanced options for Arch Linux>Arch Linux, with Linux linux-lts" \
+    GRUB_CONFIG_PATH="/boot/grub/grub.cfg" \
+    README_MARKER="<!-- managed: archarden -->" \
+    NPM_ADMIN_PORT=8181 \
+    PODMAN_API_GROUP="podman-api" \
+    DEFAULT_SSH_PORT=2122
+
+# -----------------------------------------------------------------------------
+# Runtime globals (mutable)
+# These values are derived from CLI/config inputs or computed during execution.
+# They are shared with sourced libs and steps.
+# -----------------------------------------------------------------------------
+declare -g \
+    LOG_FILE="/var/log/archarden.phase0.log" \
+    CURRENT_PHASE="phase0" \
+    CURRENT_STEP="" \
+    DRY_RUN=0 \
+    ENABLE_FAIL2BAN=1 \
+    ENABLE_FIREWALL=1 \
+    SKIP_FIREWALL_ENABLE=0 \
+    KEEP_SSH_22=0 \
+    RESTRICT_SSH_CIDR="" \
+    SSH_PORT="${DEFAULT_SSH_PORT}" \
+    USER_NAME="" \
+    USER_HOME="" \
+    PODMAN_USER="podmin" \
+    PODMAN_HOME="" \
+    PODMAN_UID="" \
+    ENSURED_PODMIN_MANAGER=0 \
+    PODMAN_PREREQS_READY=1 \
+    PODMAN_PREREQ_REASON="" \
+    PUBKEY_FILE="" \
+    PUBKEY_VALUE="" \
+    ENABLE_AUDITD=0 \
+    SYSTEM_HOSTNAME="" \
+    SSH_CONNECTION_INFO="" \
+    LOCKDOWN_STATUS=0 \
+    LOCKDOWN_REVERT=0 \
+    DOCTOR_JSON=0 \
+    DOCTOR_BUNDLE=0 \
+    CREDS_MODE=0 \
+    ANSWERS_FILE="" \
+    CONTINUE_SERVICE_TEMPLATE="" \
+    FINAL_LOG_FILE="" \
+    RUN_ID="" \
+    BACKUP_ROOT="" \
+    BACKUP_ARCHIVE="" \
+    NPM_ADMIN_EMAIL="" \
+    LE_EMAIL="" \
+    NTFY_PUBLIC_HOST="" \
+    WG_PEERS_COUNT=0 \
+    WG_INTERFACE_ADDRESS="" \
+    WG_LISTEN_PORT="" \
+    WG_DNS="" \
+    WIREGUARD_CONFIG_LOADED=0 \
+    WIREGUARD_SERVER_IP="" \
+    WIREGUARD_SERVER_ALLOWED_IP=""
+# If the caller provided a LOG_FILE, keep it.
+if [[ -n "${ENV_LOG_FILE}" ]]; then
+    LOG_FILE="${ENV_LOG_FILE}"
+fi
+
+unset ENV_LOG_FILE
+# shellcheck disable=SC2034  # shared arrays used across sourced libs and steps
+declare -g -a \
+    INVOCATION_ARGS=() \
+    PUBLIC_HOSTS=() \
+    WG_PEERS=() \
+    WIREGUARD_PEER_NAMES=() \
+    WIREGUARD_PEER_IPS=() \
+    ONLY_STEPS=() \
+    SKIP_STEPS=()
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ ! -f "${SCRIPT_DIR}/lib/loader.sh" ]]; then
+    FALLBACK_DIR="${DEFAULT_INSTALL_PREFIX}"
+    if [[ -f "${FALLBACK_DIR}/lib/loader.sh" ]]; then
+        SCRIPT_DIR="${FALLBACK_DIR}"
+    else
+        printf 'Required helper not found: %s\n' "${SCRIPT_DIR}/lib/loader.sh" >&2
+        exit 1
+    fi
+fi
+# shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+CONFIG_DIR="${SCRIPT_DIR}/config"
+TEMPLATES_DIR="${SCRIPT_DIR}/templates"
+# shellcheck source=lib/loader.sh disable=SC1091
+source "${SCRIPT_DIR}/lib/loader.sh"
+loader::source_libs
+# shellcheck source=lib/runner.sh disable=SC1091
+source "${SCRIPT_DIR}/lib/runner.sh"
+# shellcheck source=lib/steps.sh disable=SC1091
+source "${SCRIPT_DIR}/lib/steps.sh"
+
+source "${SCRIPT_DIR}/lib/lockdown.sh"
+# Canonical answers file (persisted durable inputs). Legacy fallback is ${SCRIPT_DIR}/archarden.params.
+ANSWERS_FILE="${STATE_DIR}/answers.params"
+
+CONTINUE_SERVICE_TEMPLATE="${TEMPLATES_DIR}/systemd/archarden-continue.service"
+
+PHASE0_STEPS=(
+    steps::preflight
+    steps::initialize_run_context
+    steps::install_self
+    steps::clear_pending_state
+    steps::ensure_lts_kernel_and_reboot_gate
+)
+
+PHASE1_STEPS=(
+    steps::switch_to_phase1_logging
+    verify::nf_tables_after_reboot
+    steps::install_packages
+    system::enable_timesync
+    system::configure_journald
+    system::configure_sysctl
+    system::configure_vm_tuning_sysctl
+    system::apply_sysctl_settings
+    system::configure_tmp_mount
+    system::configure_zram
+    system::configure_hostname
+    ssh::ensure_ssh_group
+    ssh::create_admin_user
+    podmin_user::ensure_podmin_user
+    podman_runtime::configure
+    podman_rootless::ensure_prereqs
+    ssh::configure_sshd
+    ssh::restart_sshd_and_verify
+    ssh::rotate_sshd_host_keys
+    wireguard::configure
+    wg_dnsmasq::configure
+    firewall::configure_ufw
+    fail2ban::configure
+    quadlet::configure_podman_templates
+    podman_rootless::configure_quadlets
+    steps::bootstrap_service_admins
+    steps::configure_podman_api_proxy
+    socket_proxy::configure
+    verify::podman_runtime
+    system::verify_zram_swap
+    system::ensure_default_target
+    system::disable_units_from_config
+    net_detect::status_report
+    podman_rootless::run_final_checks
+    steps::configure_notifications
+    system::disable_mdns_llmnr
+    verify::security_posture
+    steps::final_summary
+    steps::write_user_readme
+    steps::archive_backups
+    steps::finalize_resume_state
+    steps::trigger_final_reboot
+)
+
+archarden::__set_phase_from_args() {
+  # Purpose: Set phase from args.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    local arg
+    CURRENT_PHASE="phase0"
+    LOG_FILE="${PHASE0_LOG}"
+    for arg in "$@"; do
+        if [[ "${arg}" == "--resume" ]]; then
+            CURRENT_PHASE="phase1"
+            LOG_FILE="${PHASE1_LOG}"
+            break
+        fi
+    done
+    export LOG_FILE
+}
+
+archarden::__resume_needs_restore() {
+  # Purpose: Resume needs restore.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    local arg resume_present=0
+    for arg in "$@"; do
+        if [[ "${arg}" == "--resume" ]]; then
+            resume_present=1
+            break
+        fi
+    done
+    if [[ ${resume_present} -eq 1 && $# -eq 1 ]]; then
+        return 0
+    fi
+    return 1
+}
+
+archarden::__show_version() {
+  # Purpose: Show version.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    local version_file="${SCRIPT_DIR}/VERSION"
+    if [[ -f "${version_file}" ]]; then
+        cat "${version_file}"
+    else
+        echo "unknown"
+    fi
+}
+
+archarden::__usage() {
+  # Purpose: Usage.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    cat <<'USAGE'
+Usage:
+  sudo ./archarden [apply] [options]
+  sudo ./archarden lockdown [options]
+  sudo ./archarden creds [options]
+  sudo ./archarden verify [options]
+  sudo ./archarden doctor [options]
+  sudo ./archarden notify init [options]
+  sudo ./archarden wg export [options]
+
+Required:
+  --hostname <name>            Set the system hostname.
+  --user <name>                Create or ensure admin user exists and in wheel group.
+  --pubkey-file <path>         Public key file to install for the admin user.
+  --pubkey "<key>"             Public key string to install for the admin user.
+
+Runtime inputs (persisted to /var/lib/archarden/answers.params):
+  --le-email <email>           Email used for Let's Encrypt.
+  --npm-admin-email <email>    NPM admin login email (used by 'creds' to rotate from admin@example.com).
+  --public-host <hostname>     Public hostname to provision in NPM (repeatable).
+  --ntfy-public-host <hostname>    Public hostname to expose ntfy via NPM (e.g. ntfy.example.com).
+  --wg-peers <N>               Number of WireGuard peers to generate.
+  --wg-interface-address CIDR  WireGuard server address (e.g. 10.66.66.1/24)
+
+SSH:
+  --ssh-port <port>            SSH port to configure (default: 2122).
+  --restrict-ssh-cidr <CIDR>   Restrict SSH via UFW to the given CIDR.
+  --keep-ssh-22                Keep port 22 allowed (transition).
+
+Optional services:
+  --enable-auditd              Install and enable auditd.
+  --disable-fail2ban           Skip fail2ban configuration.
+  --disable-firewall           Skip firewall configuration (alias: --disable-ufw).
+  --skip-firewall-enable       Write UFW rules but do not enable the firewall.
+
+WireGuard tools:
+  wg export                   Bundle WireGuard client configs for retrieval.
+
+Notify tools:
+  notify init                 Initialize ntfy notification plumbing.
+    --backend <ntfy>          Notification backend for notify init (default: ntfy).
+    --ntfy-url <url>          Explicit ntfy base URL for notify init.
+    --ntfy-topic <topic>      Topic to publish to when using ntfy (default: archarden).
+    --ntfy-token <token>      Optional bearer token for ntfy publish.
+    --ntfy-user <user>        Optional ntfy basic-auth user.
+    --ntfy-pass <pass>        Optional ntfy basic-auth password.
+
+Behavior:
+  --only <steps>               Comma-separated step list to run (phase-aware).
+  --skip <steps>               Comma-separated step list to skip (phase-aware).
+  --dry-run                    Show actions without changing the system.
+  --verbose                    Doctor-only: include command output details.
+  --json                       Doctor-only: output JSON (no human report).
+  --bundle                     Doctor-only: create a redacted diagnostics tarball.
+  --bundle-dir <dir>           Doctor-only: output directory for --bundle.
+  --status                     Lockdown-only: show status report and exit.
+  --revert                     Lockdown-only: revert wg-only SSH restrictions.
+  --resume                     Internal flag: resume after reboot.
+  --version                    Show version and exit.
+  -h, --help                   Show this help.
+
+Notes:
+  Arguments are resolved with precedence: CLI > answers file > legacy ./archarden.params.
+  'lockdown' is a post-bootstrap command (stage 2) and does not run the full hardening flow.
+  'verify' runs post-install exposure checks and fails on unexpected public listeners.
+  'doctor' is a read-only diagnostics report; it does not change the system.
+USAGE
+}
+
+archarden::__parse_step_filters() {
+  # Purpose: Parse step filters.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    local value="$1"; shift
+    local -n target=$1
+    target=()
+    IFS=',' read -r -a target <<<"${value}"
+    local idx
+    for idx in "${!target[@]}"; do
+        target[idx]="${target[idx]//[[:space:]]/}"
+    done
+}
+
+archarden::__parse_args() {
+  # Purpose: Parse args.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    RESUME_MODE=0
+    LOCKDOWN_STATUS=0
+    LOCKDOWN_REVERT=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hostname) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                SYSTEM_HOSTNAME="$2"; shift 2;;
+            --user) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                USER_NAME="$2"; shift 2;;
+            --pubkey-file) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                PUBKEY_FILE="$2"; shift 2;;
+            --pubkey) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                PUBKEY_VALUE="$2"; shift 2;;
+            --version) archarden::__show_version; exit 0;;
+            --ssh-port) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                SSH_PORT="$2"; shift 2;;
+            --restrict-ssh-cidr) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                RESTRICT_SSH_CIDR="$2"; shift 2;;
+            --keep-ssh-22) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                KEEP_SSH_22=1; shift;;
+            --enable-auditd) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                ENABLE_AUDITD=1; shift;;
+            --disable-fail2ban) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                ENABLE_FAIL2BAN=0; shift;;
+            --disable-firewall|--disable-ufw) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                ENABLE_FIREWALL=0; shift;;
+            --skip-firewall-enable) # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+                SKIP_FIREWALL_ENABLE=1; shift;;
+            --le-email) # shellcheck disable=SC2034
+                LE_EMAIL="$2"; shift 2;;
+            --npm-admin-email) # shellcheck disable=SC2034
+                NPM_ADMIN_EMAIL="$2"; shift 2;;
+            --public-host)
+                PUBLIC_HOSTS+=("$2"); shift 2;;
+            --ntfy-public-host)
+                NTFY_PUBLIC_HOST="$2"; shift 2;;
+            --wg-peers)
+                if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+                    utils::log_error "--wg-peers requires an integer"; exit 1
+                fi
+                WG_PEERS_COUNT="$2"; shift 2;;
+            --wg-interface-address)
+                WG_INTERFACE_ADDRESS="$2"; shift 2;;
+            --only) archarden::__parse_step_filters "$2" ONLY_STEPS; shift 2;;
+            --skip) archarden::__parse_step_filters "$2" SKIP_STEPS; shift 2;;
+            --status) LOCKDOWN_STATUS=1; shift;;
+            --revert) LOCKDOWN_REVERT=1; shift;;
+            --dry-run) DRY_RUN=1; shift;;
+            --verbose) DOCTOR_VERBOSE=1; shift;;
+            --json) DOCTOR_JSON=1; shift;;
+            --bundle) DOCTOR_BUNDLE=1; shift;;
+            --bundle-dir) DOCTOR_BUNDLE_DIR="$2"; shift 2;;
+            --resume) RESUME_MODE=1; shift;;
+            -h|--help) archarden::__usage; exit 0;;
+            *) utils::log_error "Unknown option: $1"; archarden::__usage; exit 1;;
+        esac
+    done
+    export DRY_RUN
+}
+
+archarden::__load_param_file_args() {
+  # Purpose: Load param file args.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+  # Reads a params file into an argv array.
+  # Strips comments and blank lines. Returns 0 if args loaded, 1 if file missing/empty.
+    local file="$1"; shift
+    local -n _out_argv=$1
+    _out_argv=()
+    [[ -f "${file}" ]] || return 1
+
+    # Remove comments and blank lines.
+    # Note: Inline comments are stripped; avoid placing '#' in values.
+    local cleaned
+    cleaned=$(sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "${file}" | grep -vE '^[[:space:]]*$' || true)
+    [[ -n "${cleaned}" ]] || return 1
+
+    # Parse shell-style quoting/backslashes without treating quotes as literal characters.
+    # This is needed because __persist_answers writes values with quoting/escaping.
+    local parsed_out rc
+    parsed_out=$(printf '%s\n' "${cleaned}" | xargs -n1 printf '%s\n' 2>/dev/null)
+    rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+        utils::log_error "Failed to parse params file: ${file}"
+        exit 1
+    fi
+
+    local -a parsed=()
+    mapfile -t parsed <<<"${parsed_out}"
+	[[ ${#parsed[@]} -gt 0 ]] || return 1
+
+	# xargs may emit a blank line when the params file includes an explicitly empty
+	# quoted value (e.g., ""). Avoid passing an empty argv element into the option
+	# parser, which would surface as "Unknown option:".
+	local -a filtered=()
+	local tok
+	for tok in "${parsed[@]}"; do
+	  [[ -n "${tok}" ]] && filtered+=("${tok}")
+	done
+	[[ ${#filtered[@]} -gt 0 ]] || return 1
+	_out_argv=("${filtered[@]}")
+    return 0
+}
+
+archarden::__persist_answers() {
+  # Purpose: Persist answers.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+  # Persist durable CLI inputs to ${ANSWERS_FILE}. No-op in dry-run or resume.
+    [[ ${DRY_RUN} -eq 0 ]] || return 0
+    [[ ${RESUME_MODE:-0} -eq 0 ]] || return 0
+
+    # Required durable inputs.
+    if [[ -z "${SYSTEM_HOSTNAME}" || -z "${USER_NAME}" ]]; then
+        utils::log_warn "Skipping answers persistence: missing --hostname or --user"
+        return 0
+    fi
+    if [[ -z "${PUBKEY_FILE}" && -z "${PUBKEY_VALUE}" ]]; then
+        utils::log_warn "Skipping answers persistence: missing --pubkey-file or --pubkey"
+        return 0
+    fi
+
+    fs::ensure_dir "${STATE_DIR}" 0700 root root
+
+    local tmp
+    tmp="$(mktemp)"
+    {
+        echo "# archarden persisted inputs"
+        echo "--hostname \"${SYSTEM_HOSTNAME}\""
+        echo "--user \"${USER_NAME}\""
+        if [[ -n "${PUBKEY_FILE}" ]]; then
+            echo "--pubkey-file \"${PUBKEY_FILE}\""
+        else
+            echo "--pubkey \"${PUBKEY_VALUE}\""
+        fi
+        [[ "${SSH_PORT}" != "${DEFAULT_SSH_PORT}" ]] && echo "--ssh-port \"${SSH_PORT}\""
+        [[ -n "${RESTRICT_SSH_CIDR}" ]] && echo "--restrict-ssh-cidr \"${RESTRICT_SSH_CIDR}\""
+        [[ ${KEEP_SSH_22} -eq 1 ]] && echo "--keep-ssh-22"
+        [[ ${ENABLE_AUDITD} -eq 1 ]] && echo "--enable-auditd"
+        [[ ${ENABLE_FAIL2BAN} -eq 0 ]] && echo "--disable-fail2ban"
+        [[ ${ENABLE_FIREWALL} -eq 0 ]] && echo "--disable-firewall"
+        [[ ${SKIP_FIREWALL_ENABLE} -eq 1 ]] && echo "--skip-firewall-enable"
+        [[ -n "${LE_EMAIL}" ]] && echo "--le-email \"${LE_EMAIL}\""
+        [[ -n "${NPM_ADMIN_EMAIL}" ]] && printf -- "--npm-admin-email %q\n" "${NPM_ADMIN_EMAIL}"
+        [[ -n "${NTFY_PUBLIC_HOST}" ]] && printf -- "--ntfy-public-host %q\n" "${NTFY_PUBLIC_HOST}"
+        [[ "${WG_PEERS_COUNT}" != "0" ]] && echo "--wg-peers \"${WG_PEERS_COUNT}\""
+        [[ -n "${WG_INTERFACE_ADDRESS}" ]] && echo "--wg-interface-address \"${WG_INTERFACE_ADDRESS}\""
+        local h
+        for h in "${PUBLIC_HOSTS[@]}"; do
+            [[ -n "${h}" ]] && echo "--public-host \"${h}\""
+        done
+    } >"${tmp}"
+
+    utils::run_cmd "install -m 0600 -o root -g root \"${tmp}\" \"${ANSWERS_FILE}\""
+    utils::run_cmd "rm -f \"${tmp}\""
+}
+
+archarden::__validate_step_filters() {
+  # Purpose: Validate step filters.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    local -a all_steps=("${PHASE0_STEPS[@]}" "${PHASE1_STEPS[@]}")
+    local step
+    for step in "${ONLY_STEPS[@]}"; do
+        if [[ -n "${step}" ]] && ! runner::step_in_list "${step}" "${all_steps[@]}"; then
+            utils::log_warn "Requested --only step '${step}' not found in any phase"
+        fi
+    done
+    for step in "${SKIP_STEPS[@]}"; do
+        if [[ -n "${step}" ]] && ! runner::step_in_list "${step}" "${all_steps[@]}"; then
+            utils::log_warn "Requested --skip step '${step}' not found in any phase"
+        fi
+    done
+}
+
+
+
+
+archarden::__parse_notify_args() {
+  # Purpose: Parse notify args.
+    DRY_RUN=0
+    NOTIFY_TEST=0
+    NOTIFY_BACKEND="ntfy"
+    NTFY_URL=""
+    NTFY_TOPIC="$(secrets::read ntfy_topic 2>/dev/null || echo archarden)"
+    NTFY_TOKEN="$(secrets::read ntfy_token 2>/dev/null || true)"
+    NTFY_USER=""
+    NTFY_PASS=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --backend)
+                NOTIFY_BACKEND="$2"; shift 2;;
+            --ntfy-url)
+                NTFY_URL="$2"; shift 2;;
+            --ntfy-topic)
+                NTFY_TOPIC="$2"; shift 2;;
+            --ntfy-token)
+                NTFY_TOKEN="$2"; shift 2;;
+            --ntfy-user)
+                NTFY_USER="$2"; shift 2;;
+            --ntfy-pass)
+                NTFY_PASS="$2"; shift 2;;
+            --test)
+                NOTIFY_TEST=1; shift;;
+            --dry-run)
+                DRY_RUN=1; shift;;
+            -h|--help)
+                archarden::__usage; exit 0;;
+            *)
+                utils::log_error "Unknown option for notify init: $1"; archarden::__usage; exit 1;;
+        esac
+    done
+    [[ -z "${NTFY_URL}" && -n "${NTFY_PUBLIC_HOST:-}" ]] && NTFY_URL="https://${NTFY_PUBLIC_HOST}"
+    if [[ "${NOTIFY_BACKEND}" != "ntfy" ]]; then
+        utils::log_error "Unsupported notify backend '${NOTIFY_BACKEND}'. Archarden now supports ntfy only."
+        exit 1
+    fi
+    if [[ -z "${NTFY_URL}" ]]; then
+        utils::log_error "notify init requires --ntfy-url (or --ntfy-public-host persisted in answers)"
+        exit 1
+    fi
+}
+
+archarden::__run_notify_init() {
+  # Purpose: Run notify init.
+    local env_path="/etc/archarden/notify.env"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        utils::log_info "[DRY-RUN] Would verify ntfy at ${NTFY_URL}/v1/health and write ${env_path}."
+        return 0
+    fi
+    if ! ntfy::wait_ready "${NTFY_URL}"; then
+        utils::log_error "ntfy not ready at ${NTFY_URL}. Confirm NPM proxy and TLS are working, then re-run."
+        exit 1
+    fi
+    ntfy::write_env "${NTFY_URL}" "${NTFY_TOPIC}" "${NTFY_TOKEN}" "${NTFY_USER}" "${NTFY_PASS}"
+    utils::log_info "Wrote ntfy notification env: ${env_path}"
+    if [[ ${NOTIFY_TEST} -eq 1 ]]; then
+        ntfy::send_message "${NTFY_URL}" "${NTFY_TOPIC}" "archarden" "Notifications ready." 3 "${NTFY_TOKEN}" "${NTFY_USER}" "${NTFY_PASS}"
+        utils::log_info "Sent test notification to ntfy topic ${NTFY_TOPIC}."
+    fi
+}
+
+archarden::__parse_wg_args() {
+  # Purpose: Parse wg args.
+  # Inputs: Positional parameters $1..$2.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+  # Minimal parser for `wg` subcommands (does not require --hostname/--user).
+    DRY_RUN=0
+    WG_EXPORT_DIR="${STATE_DIR}/wireguard/exports"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --output-dir)
+                WG_EXPORT_DIR="$2"; shift 2;;
+            --dry-run)
+                DRY_RUN=1; shift;;
+            -h|--help)
+                archarden::__usage; exit 0;;
+            *)
+                utils::log_error "Unknown option for wg: $1"; archarden::__usage; exit 1;;
+        esac
+    done
+    export DRY_RUN
+}
+
+archarden::__run_wg_export() {
+  # Purpose: Run wg export.
+  # Inputs: Positional parameters $1..$1.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    local clients_dir="${STATE_DIR}/wireguard/clients"
+    local registry_file="${STATE_DIR}/wireguard/peers.json"
+    local ts shortname bundle_dir bundle_path staging
+
+    shortname="$(hostname -s 2>/dev/null || true)"
+    [[ -n "${shortname}" ]] || shortname="server"
+    ts="$(date -u '+%Y%m%d-%H%M%S')"
+    bundle_dir="${WG_EXPORT_DIR}"
+    bundle_path="${bundle_dir}/wireguard-clients-${shortname}-${ts}.tar.gz"
+
+    if [[ ${DRY_RUN} -eq 0 ]]; then
+        if [[ ! -d "${clients_dir}" ]]; then
+            die "WireGuard client directory not found: ${clients_dir}"
+        fi
+    else
+        utils::log_info "[DRY-RUN] Would export WireGuard client configs from ${clients_dir}"
+        utils::log_info "[DRY-RUN] Would include peer registry if present: ${registry_file}"
+        utils::log_info "[DRY-RUN] Would write export bundle to: ${bundle_path}"
+        return 0
+    fi
+
+    fs::ensure_dir "${bundle_dir}" 0700 root root
+    staging="$(mktemp -d)"
+    fs::ensure_dir "${staging}/clients" 0700 root root
+
+    shopt -s nullglob
+    local confs=("${clients_dir}"/*.conf)
+    shopt -u nullglob
+    if [[ ${#confs[@]} -eq 0 ]]; then
+        utils::run_cmd "rm -rf \"${staging}\""
+        die "No WireGuard client configs found under ${clients_dir}"
+    fi
+
+    local conf
+    for conf in "${confs[@]}"; do
+        utils::run_cmd "cp -a \"${conf}\" \"${staging}/clients/\""
+    done
+
+    if [[ -f "${registry_file}" ]]; then
+        utils::run_cmd "cp -a \"${registry_file}\" \"${staging}/peers.json\""
+    else
+        utils::log_warn "Peer registry not found at ${registry_file}; exporting client configs only"
+    fi
+
+    if utils::have_cmd qrencode; then
+        fs::ensure_dir "${staging}/qrs" 0700 root root
+        for conf in "${confs[@]}"; do
+            local base
+            base="$(basename "${conf}" .conf)"
+            utils::run_cmd "qrencode -t png -o \"${staging}/qrs/${base}.png\" < \"${conf}\""
+        done
+    else
+        utils::log_info "qrencode not found; skipping QR image generation"
+    fi
+
+    utils::run_cmd "sh -c 'cd \"${staging}\" && sha256sum clients/*.conf > SHA256SUMS'"
+    utils::run_cmd "sh -c 'cd \"${staging}\" && tar -czf \"${bundle_path}\" .'"
+    utils::run_cmd "rm -rf \"${staging}\""
+
+    utils::log_info "WireGuard export bundle written: ${bundle_path}"
+    utils::log_info "Retrieve it via scp (example): scp root@<server-ip>:\"${bundle_path}\" ."
+}
+
+archarden::main() {
+  # Purpose: Main.
+  # Inputs: Positional parameters $1..$1.
+  # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
+    local command="apply"
+    if [[ "${1:-}" == "apply" ]]; then
+        shift
+    elif [[ "${1:-}" == "lockdown" ]]; then
+        command="lockdown"
+        shift
+    elif [[ "${1:-}" == "verify" ]]; then
+        command="verify"
+        shift
+    elif [[ "${1:-}" == "creds" ]]; then
+        command="creds"
+        shift
+    elif [[ "${1:-}" == "doctor" ]]; then
+        command="doctor"
+        shift
+    elif [[ "${1:-}" == "notify" ]]; then
+        command="notify"
+        shift
+    elif [[ "${1:-}" == "wg" ]]; then
+        command="wg"
+        shift
+    fi
+
+    local -a cli_args file_args merged_args
+    cli_args=("$@")
+
+    for arg in "${cli_args[@]}"; do
+        case "${arg}" in
+            -h|--help) archarden::__usage; exit 0;;
+            --version) archarden::__show_version; exit 0;;
+        esac
+    done
+
+    utils::require_root
+
+    if [[ "${command}" == "lockdown" ]]; then
+        if [[ " ${cli_args[*]} " == *" --resume "* ]]; then
+            utils::log_error "lockdown does not support --resume"
+            exit 1
+        fi
+        merged_args=()
+        if archarden::__load_param_file_args "${ANSWERS_FILE}" file_args; then
+            merged_args+=("${file_args[@]}")
+        elif archarden::__load_param_file_args "${SCRIPT_DIR}/archarden.params" file_args; then
+            merged_args+=("${file_args[@]}")
+        fi
+        merged_args+=("${cli_args[@]}")
+
+        archarden::__parse_args "${merged_args[@]}"
+
+        INVOCATION_ARGS=("${merged_args[@]}")
+        lockdown::run
+        exit 0
+    fi
+
+    if [[ "${command}" == "verify" ]]; then
+        merged_args=()
+        if archarden::__load_param_file_args "${ANSWERS_FILE}" file_args; then
+            merged_args+=("${file_args[@]}")
+        elif archarden::__load_param_file_args "${SCRIPT_DIR}/archarden.params" file_args; then
+            merged_args+=("${file_args[@]}")
+        fi
+        merged_args+=("${cli_args[@]}")
+
+        archarden::__parse_args "${merged_args[@]}"
+        verify::security_posture
+        exit 0
+    fi
+
+    if [[ "${command}" == "creds" ]]; then
+        merged_args=()
+        if archarden::__load_param_file_args "${ANSWERS_FILE}" file_args; then
+            merged_args+=("${file_args[@]}")
+        elif archarden::__load_param_file_args "${SCRIPT_DIR}/archarden.params" file_args; then
+            merged_args+=("${file_args[@]}")
+        fi
+        merged_args+=("${cli_args[@]}")
+
+        archarden::__parse_args "${merged_args[@]}"
+        creds::run
+        exit $?
+    fi
+    if [[ "${command}" == "doctor" ]]; then
+    merged_args=()
+    if archarden::__load_param_file_args "${ANSWERS_FILE}" file_args; then
+        merged_args+=("${file_args[@]}")
+    elif archarden::__load_param_file_args "${SCRIPT_DIR}/archarden.params" file_args; then
+        merged_args+=("${file_args[@]}")
+    fi
+    merged_args+=("${cli_args[@]}")
+
+    archarden::__parse_args "${merged_args[@]}"
+
+    if [[ ${DOCTOR_BUNDLE:-0} -eq 1 ]]; then
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            doctor::run
+            echo "[DRY-RUN] Would write doctor bundle to ${DOCTOR_BUNDLE_DIR}"
+            exit 0
+        fi
+
+        local tmpdir report rc
+        tmpdir="$(mktemp -d)"
+        report="${tmpdir}/doctor_report.txt"
+
+        set +e
+        doctor::run 2>&1 | tee "${report}"
+        rc=${PIPESTATUS[0]}
+        set -e
+
+        doctor::bundle_create "${report}" "${rc}"
+        rm -rf "${tmpdir}"
+        exit "${rc}"
+    fi
+
+    if [[ ${DOCTOR_JSON:-0} -eq 1 ]]; then
+        doctor::run_json
+        exit $?
+    fi
+
+    doctor::run
+    exit $?
+    fi
+
+    if [[ "${command}" == "notify" ]]; then
+    local notify_action
+    notify_action="${cli_args[0]:-}"
+    if [[ -z "${notify_action}" ]]; then
+        utils::log_error "notify requires a subcommand (init)"
+        archarden::__usage
+        exit 1
+    fi
+    if [[ "${notify_action}" != "init" ]]; then
+        utils::log_error "Unknown notify subcommand: ${notify_action}"
+        archarden::__usage
+        exit 1
+    fi
+    cli_args=("${cli_args[@]:1}")
+    merged_args=()
+    if archarden::__load_param_file_args "${ANSWERS_FILE}" file_args; then
+        merged_args+=("${file_args[@]}")
+    elif archarden::__load_param_file_args "${SCRIPT_DIR}/archarden.params" file_args; then
+        merged_args+=("${file_args[@]}")
+    fi
+    merged_args+=("${cli_args[@]}")
+    archarden::__parse_args "${merged_args[@]}"
+    archarden::__parse_notify_args "${cli_args[@]}"
+    archarden::__run_notify_init
+    exit 0
+fi
+
+if [[ "${command}" == "wg" ]]; then
+        local wg_action
+        wg_action="${cli_args[0]:-}"
+        if [[ -z "${wg_action}" ]]; then
+            utils::log_error "wg requires a subcommand (export)"
+            archarden::__usage
+            exit 1
+        fi
+        if [[ "${wg_action}" != "export" ]]; then
+            utils::log_error "Unknown wg subcommand: ${wg_action}"
+            archarden::__usage
+            exit 1
+        fi
+        # Drop the subcommand token and parse wg options
+        cli_args=("${cli_args[@]:1}")
+        archarden::__parse_wg_args "${cli_args[@]}"
+        archarden::__run_wg_export
+        exit 0
+    fi
+
+    if archarden::__resume_needs_restore "${cli_args[@]}"; then
+        if [[ ! -s "${PENDING_ARGS_FILE}" ]]; then
+            utils::log_error "Resume requested but pending args missing at ${PENDING_ARGS_FILE}"
+            exit 1
+        fi
+        local -a pending_file_args=()
+        if ! archarden::__load_param_file_args "${PENDING_ARGS_FILE}" pending_file_args; then
+            utils::log_error "Resume requested but pending args could not be parsed from ${PENDING_ARGS_FILE}"
+            exit 1
+        fi
+        merged_args=(--resume "${pending_file_args[@]}")
+        utils::log_info "Resume requested without parameters; restoring saved arguments from ${PENDING_ARGS_FILE}"
+    else
+        merged_args=()
+        # Do not overlay files in resume mode.
+        if [[ " ${cli_args[*]} " != *" --resume "* ]]; then
+            if archarden::__load_param_file_args "${ANSWERS_FILE}" file_args; then
+                merged_args+=("${file_args[@]}")
+            elif archarden::__load_param_file_args "${SCRIPT_DIR}/archarden.params" file_args; then
+                merged_args+=("${file_args[@]}")
+            fi
+        fi
+        merged_args+=("${cli_args[@]}")
+    fi
+
+    archarden::__set_phase_from_args "${merged_args[@]}"
+    archarden::__parse_args "${merged_args[@]}"
+    if [[ ${LOCKDOWN_STATUS} -eq 1 || ${LOCKDOWN_REVERT} -eq 1 ]]; then
+        utils::log_error "--status/--revert are only valid with 'lockdown' subcommand"
+        exit 1
+    fi
+    # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+    INVOCATION_ARGS=("${merged_args[@]}")
+    archarden::__validate_step_filters
+
+    archarden::__persist_answers
+
+    if [[ ${RESUME_MODE} -eq 0 ]]; then
+        runner::run_steps "phase0" PHASE0_STEPS
+    else
+        # shellcheck disable=SC2034  # shared globals used across sourced libs and steps
+        CURRENT_PHASE="phase1"
+        LOG_FILE="${PHASE1_LOG}"
+        export LOG_FILE
+    fi
+
+    runner::run_steps "phase1" PHASE1_STEPS
+}
+
+archarden::main "$@"

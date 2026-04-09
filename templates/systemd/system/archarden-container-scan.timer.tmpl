@@ -1,0 +1,9 @@
+[Unit]
+Description=Run archarden container update scan weekly
+
+[Timer]
+OnCalendar=Sun 04:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

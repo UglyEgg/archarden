@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+env_file="/etc/archarden/notify.env"
+if [[ -f "${env_file}" ]]; then
+  # shellcheck disable=SC1090
+  source "${env_file}"
+fi
+
+external_url="${NTFY_EXTERNAL_URL:-${NTFY_URL:-}}"
+if [[ -z "${external_url}" ]]; then
+  exit 0
+fi
+
+if ! curl -fsS -k --max-time 6 --connect-timeout 3 "${external_url%/}/v1/health" >/dev/null 2>&1; then
+  if [[ -x /usr/lib/archarden/notify_send.sh ]]; then
+    /usr/lib/archarden/notify_send.sh       "ntfy endpoint unreachable"       "Health check failed for ${external_url%/} at $(date -u +%Y-%m-%dT%H:%M:%SZ). NPM/proxy may be misconfigured or down." || true
+  fi
+fi

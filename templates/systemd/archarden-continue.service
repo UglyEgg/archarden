@@ -1,0 +1,14 @@
+[Unit]
+Description=Continue archarden hardening after reboot
+ConditionPathExists=__PENDING_ARGS_FILE__
+After=network.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+TimeoutStopSec=30s
+ExecStart=__INSTALL_PREFIX__/archarden --resume
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

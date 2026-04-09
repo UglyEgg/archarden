@@ -1,18 +1,30 @@
 [Unit]
 Description=Nginx Proxy Manager (bound to localhost)
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Container]
 Image=docker.io/jc21/nginx-proxy-manager:latest
-Network=slirp4netns
+# Seed initial admin non-interactively for versions that removed the default user.
+EnvironmentFile=%h/.config/archarden/npm.env
+Network=archarden
+NetworkAlias=npm
 PublishPort=127.0.0.1:8080:80/tcp
 PublishPort=127.0.0.1:8443:443/tcp
 PublishPort=127.0.0.1:8181:81/tcp
 Volume=npm-data:/data
 Volume=npm-letsencrypt:/etc/letsencrypt
+AutoUpdate=registry
 Memory=512M
 PidsLimit=512
 PodmanArgs=--memory-swap=1G
+
+[Service]
+# Ensure the shared user network exists before container start.
+ExecStartPre=-/usr/bin/podman network create --label app=archarden archarden
+ExecStartPre=/usr/bin/podman network inspect archarden
+Restart=on-failure
+RestartSec=5s
 
 [Install]
 WantedBy=default.target

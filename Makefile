@@ -1,18 +1,37 @@
+## SPDX-License-Identifier: GPL-3.0-or-later
+## Copyright 2026 Richard Majewski
+
 SHELL := /bin/bash
 
 lint:
-	shellcheck harden lib/*.sh
+	shellcheck archarden lib/*.sh scripts/*.sh
+	./scripts/check-naming.sh
 
 fmt:
-	shfmt -w harden lib/*.sh
+	shfmt -w archarden lib/*.sh scripts/*.sh
+
+fmt-check:
+	shfmt -d archarden lib/*.sh scripts/*.sh
 
 test:
 	bats test/
 
+check-naming:
+	./scripts/check-naming.sh
+
 install:
-	sudo ./harden $(EXTRA_FLAGS)
+	sudo ./archarden $(EXTRA_FLAGS)
 
 dry-run:
-	sudo ./harden --dry-run --non-interactive --skip-firewall-enable $(EXTRA_FLAGS)
+	sudo ./archarden --dry-run --skip-firewall-enable $(EXTRA_FLAGS)
 
-.PHONY: lint fmt test install dry-run
+.PHONY: lint fmt fmt-check test install dry-run check-naming
+
+docs-functions:
+	./scripts/gen_function_docs.py
+
+docs-nav-check:
+	./scripts/check-mkdocs-nav.py
+
+docs: docs-functions docs-nav-check
+	@echo "Docs generated. Run 'mkdocs serve' if installed."

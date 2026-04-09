@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+notify_bin="/usr/lib/archarden/notify_send.sh"
+auto_update_output=""
+ps_output=""
+updates_rc=0
+
+poduser="podmin"
+poduid=""
+podhome=""
+runtime_dir=""
+
+if command -v podman >/dev/null 2>&1; then
+  poduid=$(id -u "${poduser}" 2>/dev/null || true)
+  podhome=$(getent passwd "${poduser}" 2>/dev/null | cut -d: -f6)
+  if [[ -z "${podhome}" ]]; then
+    podhome="/home/${poduser}"
+  fi
+  if [[ -n "${poduid}" ]]; then
+    runtime_dir="/run/user/${poduid}"
+  fi
+  if [[ -z "${runtime_dir}" ]]; then
+    runtime_dir="/run/user/2000"
+  fi
+  auto_update_output=$(runuser -u "${poduser}" -- env HOME="${podhome}" XDG_RUNTIME_DIR="${runtime_dir}" podman auto-update --dry-run 2>&1) || updates_rc=$?
+  ps_output=$(runuser -u "${poduser}" -- env HOME="${podhome}" XDG_RUNTIME_DIR="${runtime_dir}" podman ps --format '{{.Names}}	{{.Image}}	{{.Status}}' 2>&1 || true)
+else
+  updates_rc=1
+  auto_update_output="podman not available"
+fi
+
+trimmed_updates=$(echo "${auto_update_output}" | sed '/^[[:space:]]*$/d')
+
+if [[ ${updates_rc} -ne 0 ]]; then
+  message="Podman auto-update --dry-run failed:
+${auto_update_output}"
+  if [[ -n "${ps_output}" ]]; then
+    message+="
+
+Running containers:
+${ps_output}"
+  fi
+  "${notify_bin}" "Container update scan failed" "${message}"
+  exit 0
+fi
+
+if [[ -z "${trimmed_updates}" ]]; then
+  exit 0
+fi
+
+message="Podman auto-update --dry-run reports updates are available:
+${auto_update_output}"
+if [[ -n "${ps_output}" ]]; then
+  message+="
+
+Running containers:
+${ps_output}"
+fi
+
+"${notify_bin}" "Container updates available" "${message}"

@@ -1,0 +1,68 @@
+site_name: Archarden
+site_description: Archarden — reproducible Arch Linux VPS bootstrap, hardening, and VPN-gated service orchestration.
+repo_name: archarden
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: green
+      accent: green
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - content.code.copy
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Overview: getting-started/overview.md
+      - Requirements: getting-started/requirements.md
+      - Install and Run: getting-started/run.md
+      - Configuration: getting-started/configuration.md
+      - Dry Run: getting-started/dry-run.md
+  - Operations:
+      - Execution Model: operations/execution-model.md
+      - Operator Flow: operations/operator-flow.md
+      - Phases and Steps: operations/phases-and-steps.md
+      - Resume and State: operations/resume-and-state.md
+      - Lockdown: operations/lockdown.md
+      - Verify: operations/verify.md
+      - Doctor: operations/doctor.md
+      - Credentials: operations/creds.md
+      - Notifications: operations/notifications.md
+      - WireGuard Export: operations/wireguard-export.md
+      - Troubleshooting: operations/troubleshooting.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Security: architecture/security.md
+      - Filesystem Layout: architecture/filesystem-layout.md
+      - Templates Pipeline: architecture/templates.md
+      - Data Flow: architecture/data-flow.md
+      - Design Tradeoffs and Limitations: architecture/design-tradeoffs.md
+      - Potential Future Roadmap: architecture/potential-future-roadmap.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Params File: reference/params.md
+      - Templates: reference/templates.md
+      - Systemd Units: reference/systemd.md
+      - Function Reference:
+          - Index: reference/functions/index.md
+          - All Functions: reference/functions/all.md
+  - Developer:
+      - Module Map: dev/module-map.md
+      - Style Guide: dev/style.md
+      - Architecture Rules: dev/architecture-rules.md
+      - Testing and CI: dev/testing-ci.md
+      - Contributing: dev/contributing.md

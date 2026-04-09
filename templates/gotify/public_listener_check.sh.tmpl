@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Periodic public listener verification.
+# Sends a Gotify alert when unexpected public listeners are detected.
+
+out=""
+rc=0
+
+if ! out=$(/usr/bin/archarden verify 2>&1); then
+  rc=$?
+fi
+
+if [[ ${rc} -eq 0 ]]; then
+  exit 0
+fi
+
+# Extract the actionable part of verify output (keep it short).
+msg=$(echo "${out}" | sed -n '1,200p')
+
+/usr/lib/archarden/gotify_send.sh "Archarden: unexpected listeners" "${msg}" || true
+
+exit 0
