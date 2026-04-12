@@ -60,8 +60,14 @@ verify::security_posture() {
     fi
 
     local lockdown_active=0
-    if [[ -f "${LOCKDOWN_MARKER_FILE}" ]]; then
+    if [[ -n "${ARCHARDEN_EXPECT_LOCKDOWN:-}" || -f "${LOCKDOWN_MARKER_FILE}" ]]; then
         lockdown_active=1
+    fi
+
+    # Defensive re-application for fresh installs where resolver listeners can survive until
+    # late in Phase 1 even though the intended hardened state disables them.
+    if declare -F system::disable_mdns_llmnr >/dev/null 2>&1; then
+        system::disable_mdns_llmnr || true
     fi
 
     local -a global_v4=() global_v6=()
@@ -90,6 +96,9 @@ verify::security_posture() {
     if [[ ${lockdown_active} -eq 0 ]]; then
         # Before lockdown, SSH may still be intentionally reachable.
         allowed_tcp+=("${SSH_PORT}")
+        if [[ ${KEEP_SSH_22:-0} -eq 1 && "${SSH_PORT}" != "22" ]]; then
+            allowed_tcp+=("22")
+        fi
     fi
 
     # UFW should be active unless explicitly disabled.

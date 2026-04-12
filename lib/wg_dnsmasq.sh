@@ -4,6 +4,34 @@
 
 # dnsmasq integration for wg0 (split-horizon/internal DNS) extracted from lib/steps.sh.
 
+wg_dnsmasq::__wait_for_wg0() {
+  # Purpose: Wait briefly for wg0 to exist before restarting dnsmasq.
+  # Inputs: None.
+  # Outputs: Return 0 when wg0 exists; non-zero on timeout.
+    local attempt
+    if [[ ${DRY_RUN:-0} -eq 1 ]]; then
+        return 0
+    fi
+    for attempt in $(seq 1 20); do
+        if ip link show wg0 >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wg_dnsmasq::__install_wg_refresh_dropin() {
+  # Purpose: Ensure wg-quick refreshes dnsmasq after wg0 is brought up.
+  # Inputs: None.
+  # Outputs: Return 0 on success; non-zero on error.
+    local dropin_path="/etc/systemd/system/wg-quick@wg0.service.d/archarden-dnsmasq-refresh.conf"
+    utils::install_template_root_file \
+        "templates/systemd/system/wg-quick@wg0.service.d/archarden-dnsmasq-refresh.conf.tmpl" \
+        "${dropin_path}" 0644 root root
+    systemd::daemon_reload
+}
+
 wg_dnsmasq::__upstream_resolv_file() {
   # Purpose: Upstream resolv file.
   # Inputs: Positional parameters $1..$1.
@@ -53,6 +81,8 @@ wg_dnsmasq::configure() {
         backup::file "${conf_file}"
     fi
 
+    wg_dnsmasq::__install_wg_refresh_dropin
+
     utils::write_file_atomic "${conf_file}" <<EOT
 # Managed by archarden. Do not edit.
 
@@ -61,7 +91,6 @@ interface=wg0
 bind-dynamic
 
 # Upstream resolvers come from the system resolver.
-no-resolv
 resolv-file=${upstream_resolv}
 
 # Basic hygiene.
@@ -78,6 +107,9 @@ EOT
     fi
 
     systemd::enable_now dnsmasq.service
+    if ! wg_dnsmasq::__wait_for_wg0; then
+        utils::log_warn "wg0 did not appear before restarting dnsmasq; service may bind to loopback until wg0 is up"
+    fi
     systemd::restart dnsmasq.service
     steps::run_status_capture "systemctl is-active dnsmasq" systemctl is-active dnsmasq.service
 }

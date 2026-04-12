@@ -23,7 +23,7 @@ firewall::configure_ufw() {
     if firewall::_iptables_is_nft; then
         utils::log_info "iptables backend reports nf_tables (nft)"
     else
-        utils::log_warn "UFW backend is not reporting nftables; ensure iptables-nft is the active alternative."
+        utils::log_warn "UFW backend is not reporting nftables; ensure the current Arch `iptables` package is installed (nft-backed) and that legacy tooling is not forcing a non-nft path."
     fi
 
     if [[ -n "${RESTRICT_SSH_CIDR}" ]]; then
@@ -32,9 +32,6 @@ firewall::configure_ufw() {
         utils::run_cmd "ufw limit ${SSH_PORT}/tcp"
     fi
 
-    if ss -tulpn 2>/dev/null | grep -q ':22'; then
-        utils::run_cmd "ufw allow 22/tcp"
-    fi
     if [[ ${KEEP_SSH_22} -eq 1 ]]; then
         utils::run_cmd "ufw allow 22/tcp"
     fi
@@ -64,14 +61,7 @@ firewall::configure_ufw() {
     fi
 
 	utils::run_cmd "ufw --force enable"
-    systemd::enable_now ufw
-    if [[ ${KEEP_SSH_22} -eq 0 ]]; then
-        if [ "${DRY_RUN}" -eq 0 ]; then
-            ufw delete allow 22/tcp >/dev/null 2>&1 || true
-        else
-            utils::log_info "[DRY-RUN] Would remove legacy SSH port 22 rule"
-        fi
-    fi
+    systemd::enable ufw
 	utils::run_cmd "ufw reload"
 
 	# UFW can reset rule file permissions on reload; enforce non-world-readable modes
@@ -155,7 +145,7 @@ firewall::configure_ufw_lockdown() {
     fi
 
     utils::run_cmd "ufw --force enable"
-    systemd::enable_now ufw
+    systemd::enable ufw
     utils::run_cmd "ufw reload"
 
     # ufw can emit warnings if its rules files are world-readable. This is not
@@ -199,9 +189,6 @@ firewall::configure_ufw_revert() {
         utils::run_cmd "ufw limit ${SSH_PORT}/tcp"
     fi
 
-    if ss -tulpn 2>/dev/null | grep -q ':22'; then
-        utils::run_cmd "ufw allow 22/tcp"
-    fi
     if [[ ${KEEP_SSH_22} -eq 1 ]]; then
         utils::run_cmd "ufw allow 22/tcp"
     fi
@@ -241,14 +228,7 @@ firewall::configure_ufw_revert() {
     fi
 
     utils::run_cmd "ufw --force enable"
-    systemd::enable_now ufw
-    if [[ ${KEEP_SSH_22} -eq 0 ]]; then
-        if [[ ${DRY_RUN} -eq 0 ]]; then
-            ufw delete allow 22/tcp >/dev/null 2>&1 || true
-        else
-            utils::log_info "[DRY-RUN] Would remove legacy SSH port 22 rule"
-        fi
-    fi
+    systemd::enable ufw
     utils::run_cmd "ufw reload"
 
 	# UFW emits warnings if rule files are world-readable. Some operations (including reload)
@@ -302,7 +282,8 @@ firewall::_iptables_is_nft() {
         return 1
     fi
 
-    # Most reliable: version string typically includes "nf_tables" for nft backend.
+    # On current Arch, the `iptables` package is nft-backed. The most reliable
+    # runtime signal is that the version string includes "nf_tables".
     if iptables --version 2>/dev/null | grep -q "nf_tables"; then
         return 0
     fi

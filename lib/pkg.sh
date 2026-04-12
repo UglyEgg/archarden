@@ -50,7 +50,7 @@ pkg::replace() {
 
     # Some "replacement" packages can be installed alongside the original without
     # causing pacman to error, but the system will continue using the original
-    # binaries (e.g., iptables vs iptables-nft). Prefer an explicit remove+install
+    # binaries (e.g., iptables backend package choices). Prefer an explicit remove+install
     # to ensure the replacement actually takes effect.
     if utils::run_cmd "pacman -S --noconfirm --needed ${replacement}"; then
         if pkg::is_installed "${current}"; then

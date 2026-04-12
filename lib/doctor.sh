@@ -230,6 +230,10 @@ doctor::__check_listener_present() {
         doctor::__ok "${desc}: listening"
         return 0
     fi
+    if ss -H -lnu 2>/dev/null | awk '{print $5}' | grep -qE "${pattern}"; then
+        doctor::__ok "${desc}: listening"
+        return 0
+    fi
 
     doctor::__fail "${desc}: not listening"
     [[ -n "${fix}" ]] && doctor::__fix "${fix}"
@@ -683,7 +687,7 @@ doctor::run() {
             doctor::__ok "ufw: active"
         else
             doctor::__fail "ufw: not active"
-            doctor::__fix "ufw enable && systemctl enable --now ufw"
+            doctor::__fix "ufw --force enable && systemctl enable ufw"
         fi
 
         if ufw status verbose 2>/dev/null | grep -qiE '^Default:.*deny \(incoming\)'; then
@@ -694,7 +698,7 @@ doctor::run() {
         fi
     else
         doctor::__fail "ufw not installed"
-        doctor::__fix "pacman -S ufw && systemctl enable --now ufw"
+        doctor::__fix "pacman -S ufw && ufw --force enable && systemctl enable ufw"
     fi
 
     doctor::__section "Socket proxies" 

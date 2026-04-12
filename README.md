@@ -43,3 +43,9 @@ See **docs/security.md** for the security architecture, exposure model, and furt
 ## ntfy defaults
 
 Archarden provisions ntfy as a rootless container behind NPM with `behind-proxy: true`, `auth-default-access: deny-all`, generated admin and publisher credentials, a generated publisher token, and a randomized topic. Anonymous clients are granted read-only access only to that randomized topic so the Android app can subscribe without exposing write access. The generated values are stored under `/var/lib/archarden/secrets/` and `/etc/archarden/notify.env`.
+
+
+## Firewall backend note
+
+On current Arch Linux, the `iptables` package provides the nft-backed implementation.
+Archarden prefers `iptables` and only treats `iptables-legacy` as an explicit fallback/legacy choice.

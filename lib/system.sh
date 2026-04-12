@@ -230,6 +230,6 @@ EOF
     chmod 0644 /etc/systemd/resolved.conf.d/archarden.conf
 
     # Restart if active; otherwise enablement is left to the distro image.
-    utils::run_cmd "systemctl try-restart systemd-resolved.service 2>/dev/null || true"
+    utils::run_cmd "systemctl restart systemd-resolved.service 2>/dev/null || systemctl try-restart systemd-resolved.service 2>/dev/null || true"
   fi
 }

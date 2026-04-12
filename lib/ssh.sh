@@ -2,6 +2,31 @@
 # Copyright 2026 Richard Majewski
 # shellcheck shell=bash
 
+ssh::_normalize_base_sshd_ports() {
+  # Purpose: Remove active Port directives from the base sshd_config so the managed drop-in
+  # becomes the single source of truth for the listen port.
+    local cfg=/etc/ssh/sshd_config tmp
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        utils::log_info "[DRY-RUN] Would normalize active Port directives in ${cfg}"
+        return 0
+    fi
+    [[ -f "${cfg}" ]] || return 0
+    backup::file "${cfg}"
+    tmp=$(mktemp)
+    awk '
+        /^[[:space:]]*Match[[:space:]]/ { in_match=1; print; next }
+        {
+            if (!in_match && $0 ~ /^[[:space:]]*Port[[:space:]]+[0-9]+([[:space:]]*(#.*)?)?$/) {
+                print "# archarden-disabled: " $0
+                next
+            }
+            print
+        }
+    ' "${cfg}" >"${tmp}"
+    install -m 0600 -o root -g root "${tmp}" "${cfg}"
+    rm -f "${tmp}"
+}
+
 ssh::configure_sshd() {
   # Purpose: Configure sshd.
   # Inputs: Positional parameters $1..$2.
@@ -9,6 +34,7 @@ ssh::configure_sshd() {
     local hardening_tmp
     mkdir -p "${SSHD_CONFIG_DIR}"
     utils::run_cmd "ssh-keygen -A"
+    ssh::_normalize_base_sshd_ports
     backup::file "${SSHD_HARDENING_DROPIN}"
     backup::file "${SSHD_CRYPTO_DROPIN}"
     backup::file "${SSHD_PORT_FORWARDING_DROPIN}"
@@ -273,47 +299,41 @@ ssh::__wg_listen_address() {
 }
 
 ssh::configure_sshd_wg_only_listener() {
-  # Purpose: Configure sshd wg only listener.
+  # Purpose: Normalize legacy wg-only listener state without hard-binding sshd.
   # Inputs: Positional parameters $1..$4.
   # Outputs: Return 0 on success; non-zero on error. Side effects depend on function.
-    local wg_ip dropin
-    wg_ip="$(ssh::__wg_listen_address)"
+  # VPN-only SSH is enforced by firewall policy. Binding sshd to the WG address is brittle
+  # because sshd may restart before wg0 is ready, leaving no listener at all.
+    local dropin
     dropin="${SSHD_WG_ONLY_DROPIN}"
 
     if [[ ${DRY_RUN} -eq 1 ]]; then
-        utils::log_info "[DRY-RUN] Would ensure ${SSHD_CONFIG_DIR} exists"
-        utils::log_info "[DRY-RUN] Would bind sshd to WireGuard only via ${dropin} (ListenAddress ${wg_ip})"
-        return
+        if [[ -f "${dropin}" ]]; then
+            utils::log_info "[DRY-RUN] Would remove legacy ${dropin} and keep VPN-only SSH enforced by firewall"
+        else
+            utils::log_info "[DRY-RUN] Would leave sshd listener unbound and rely on firewall for VPN-only SSH"
+        fi
+        return 0
     fi
 
     mkdir -p "${SSHD_CONFIG_DIR}"
-    backup::file "${dropin}"
-
-    cat > "${dropin}" <<EOT
-# managed: archarden
-AddressFamily inet
-ListenAddress ${wg_ip}
-EOT
-    utils::ensure_file_permissions "${dropin}" 0644 root root
+    if [[ -f "${dropin}" ]]; then
+        backup::file "${dropin}"
+        rm -f "${dropin}"
+    fi
 
     if ! sshd -t; then
-        utils::log_error "sshd validation failed after writing ${dropin}"
+        utils::log_error "sshd validation failed after removing ${dropin}"
         ssh::_restore_sshd_dropins
         exit 1
     fi
 
     systemd::restart sshd
 
-    if ! ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -qx "${wg_ip}:${SSH_PORT}"; then
-        utils::log_error "sshd is not listening on ${wg_ip}:${SSH_PORT} after wg-only bind"
+    if ! ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -qE "((0\.0\.0\.0|\[::\]|::)|10\.66\.66\.1):${SSH_PORT}\b"; then
+        utils::log_error "sshd is not listening on port ${SSH_PORT} after normalizing wg-only listener state"
         exit 1
     fi
-    if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -qE "(0.0.0.0|\[::\]|::):${SSH_PORT}\\b"; then
-        utils::log_error "sshd appears to be listening on a wildcard address for port ${SSH_PORT} after wg-only bind"
-        exit 1
-    fi
-
-    utils::log_info "sshd is now bound to WireGuard interface only (${wg_ip}:${SSH_PORT})"
 }
 
 ssh::revert_sshd_wg_only_listener() {

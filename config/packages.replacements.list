@@ -2,5 +2,8 @@
 # Format: <installed_package> <preferred_package>
 # When the preferred package is requested and the installed package is present,
 # the installed package will be removed before installing the preferred one.
-iptables iptables-nft
-iptables-legacy iptables-nft
+#
+# Arch now ships the nft-backed implementation as the `iptables` package.
+# `iptables-legacy` remains available for explicit legacy use. Prefer `iptables`
+# unless the operator intentionally requests legacy tooling.
+iptables-legacy iptables
